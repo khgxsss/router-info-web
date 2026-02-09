@@ -1,6 +1,15 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import uPlot from "uplot";
-import "uplot/dist/uPlot.min.css";
+import {
+  LineChart,
+  Line,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+  ReferenceLine,
+} from "recharts";
 
 // Nginx가 /api/ 를 sanic(35443)로 프록시하는 구성이라면 빈 문자열 유지
 const API = "";
@@ -651,205 +660,76 @@ export default function Dashboard({ user, onLogout }) {
   );
 }
 
-/** X축 라벨을 파싱하여 Unix timestamp로 변환 (uPlot은 초 단위 timestamp 사용) */
-function parseXToEpoch(val, xKey) {
-  if (!val) return null;
-  if (xKey === "d") {
-    // "2025-01-15" -> epoch seconds
-    const d = new Date(val + "T00:00:00+09:00");
-    return isNaN(d) ? null : d.getTime() / 1000;
-  }
-  if (xKey === "h") {
-    // "2025-01-15 14" -> epoch seconds
-    const d = new Date(val.replace(" ", "T") + ":00:00+09:00");
-    return isNaN(d) ? null : d.getTime() / 1000;
-  }
-  // ts: "2025-01-15 14:30:00"
-  const d = new Date(val.replace(" ", "T") + "+09:00");
-  return isNaN(d) ? null : d.getTime() / 1000;
-}
-
-/** 기준선 플러그인: center(초록) + upper(빨강 점선) */
-function refLinesPlugin(ref) {
-  if (!ref) return {};
-  return {
-    hooks: {
-      draw: [
-        (u) => {
-          const ctx = u.ctx;
-          const yAxis = u.scales.y;
-          const left = u.bbox.left;
-          const width = u.bbox.width;
-
-          // center 기준선 (초록, 굵게)
-          const centerY = u.valToPos(ref.center, "y", true);
-          if (centerY >= u.bbox.top && centerY <= u.bbox.top + u.bbox.height) {
-            ctx.save();
-            ctx.strokeStyle = "#32CD32";
-            ctx.lineWidth = 3;
-            ctx.beginPath();
-            ctx.moveTo(left, centerY);
-            ctx.lineTo(left + width, centerY);
-            ctx.stroke();
-            ctx.restore();
-          }
-
-          // upper 상한선 (빨강, 점선)
-          const upperY = u.valToPos(ref.upper, "y", true);
-          if (upperY >= u.bbox.top && upperY <= u.bbox.top + u.bbox.height) {
-            ctx.save();
-            ctx.strokeStyle = "#ef4444";
-            ctx.lineWidth = 1;
-            ctx.setLineDash([6, 4]);
-            ctx.beginPath();
-            ctx.moveTo(left, upperY);
-            ctx.lineTo(left + width, upperY);
-            ctx.stroke();
-            ctx.restore();
-          }
-        },
-      ],
-    },
-  };
-}
-
-/** 개별 지표 차트 (uPlot Canvas 기반) */
+/** 개별 지표 차트 */
 function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
-  const containerRef = useRef(null);
-  const chartRef = useRef(null);
+  const hideXAxisLabels = xKey === "ts" || xKey === "h";
   const ref = REF[metric];
 
-  useEffect(() => {
-    if (!containerRef.current || !data || data.length === 0) return;
+  let yDomain = undefined;
+  if (ref) {
+    const vals = (data || [])
+      .map((d) => d?.[dataKey])
+      .filter((v) => typeof v === "number" && !Number.isNaN(v));
+    if (vals.length) {
+      const dataMin = Math.min(...vals);
+      const dataMax = Math.max(...vals);
+      const center = ref.center;
 
-    // 기존 차트 제거
-    if (chartRef.current) {
-      chartRef.current.destroy();
-      chartRef.current = null;
+      const delta = Math.max(
+        Math.abs(dataMax - center),
+        Math.abs(center - dataMin),
+        Math.abs(ref.upper - center)
+      );
+
+      const pad = Math.max(delta * 0.05, 1);
+      yDomain = [center - (delta + pad), center + (delta + pad)];
+    } else {
+      const delta = Math.abs(ref.upper - ref.center);
+      yDomain = [ref.center - delta, ref.center + delta];
     }
-
-    // 데이터 변환: [{ts, router_rssi, ...}] -> [xArr, yArr]
-    const xArr = [];
-    const yArr = [];
-    for (let i = 0; i < data.length; i++) {
-      const row = data[i];
-      const x = parseXToEpoch(row[xKey], xKey);
-      const y = typeof row[dataKey] === "number" ? row[dataKey] : null;
-      if (x !== null) {
-        xArr.push(x);
-        yArr.push(y);
-      }
+    if (yDomain && (!Number.isFinite(yDomain[0]) || !Number.isFinite(yDomain[1]))) {
+      yDomain = undefined;
     }
-
-    if (xArr.length === 0) return;
-
-    // Y축 범위 계산 (기존 로직 유지)
-    let yRange;
-    if (ref) {
-      const vals = yArr.filter((v) => v !== null && Number.isFinite(v));
-      if (vals.length) {
-        const dataMin = Math.min(...vals);
-        const dataMax = Math.max(...vals);
-        const delta = Math.max(
-          Math.abs(dataMax - ref.center),
-          Math.abs(ref.center - dataMin),
-          Math.abs(ref.upper - ref.center)
-        );
-        const pad = Math.max(delta * 0.05, 1);
-        yRange = [ref.center - (delta + pad), ref.center + (delta + pad)];
-      } else {
-        const delta = Math.abs(ref.upper - ref.center);
-        yRange = [ref.center - delta, ref.center + delta];
-      }
-      if (!Number.isFinite(yRange[0]) || !Number.isFinite(yRange[1])) {
-        yRange = null;
-      }
-    }
-
-    const container = containerRef.current;
-    const w = container.clientWidth;
-    const h = container.clientHeight - 28; // 타이틀 높이 빼기
-
-    // X축 포맷터 결정
-    const xValues = xKey === "d"
-      ? (u, splits) => splits.map((v) => {
-          const d = new Date(v * 1000);
-          return `${(d.getMonth() + 1).toString().padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")}`;
-        })
-      : (u, splits) => splits.map((v) => {
-          const d = new Date(v * 1000);
-          return `${(d.getMonth() + 1).toString().padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")} ${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
-        });
-
-    const opts = {
-      width: w,
-      height: Math.max(h, 160),
-      cursor: {
-        drag: { x: false, y: false },
-      },
-      plugins: [refLinesPlugin(ref)],
-      legend: { show: true },
-      scales: {
-        x: { time: true },
-        y: yRange
-          ? { range: () => yRange }
-          : { auto: true },
-      },
-      axes: [
-        {
-          stroke: "#6b7280",
-          grid: { stroke: "rgba(209,213,219,0.5)", dash: [4, 4] },
-          values: xValues,
-          font: "12px system-ui",
-          ticks: { show: xKey === "d" },
-        },
-        {
-          stroke: "#6b7280",
-          grid: { stroke: "rgba(209,213,219,0.5)", dash: [4, 4] },
-          values: (u, splits) => splits.map((v) => Number.isFinite(v) ? Math.round(v) : v),
-          font: "12px system-ui",
-          size: 50,
-        },
-      ],
-      series: [
-        {},
-        {
-          label: dataKey,
-          stroke: "#2563eb",
-          width: 1.5,
-          points: { show: false },
-        },
-      ],
-    };
-
-    const uplotData = [xArr, yArr];
-    const chart = new uPlot(opts, uplotData, container);
-    chartRef.current = chart;
-
-    // resize observer
-    const ro = new ResizeObserver(() => {
-      if (chartRef.current && container) {
-        chartRef.current.setSize({
-          width: container.clientWidth,
-          height: Math.max(container.clientHeight - 28, 160),
-        });
-      }
-    });
-    ro.observe(container);
-
-    return () => {
-      ro.disconnect();
-      if (chartRef.current) {
-        chartRef.current.destroy();
-        chartRef.current = null;
-      }
-    };
-  }, [data, dataKey, xKey, metric, ref]);
+  }
 
   return (
     <div style={styles.chartCard}>
       <div style={{ marginBottom: 6, fontWeight: 700, color: "#111827" }}>{title}</div>
-      <div ref={containerRef} style={{ width: "100%", height: "calc(100% - 28px)" }} />
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={data}>
+          <CartesianGrid strokeDasharray="4 4" />
+          <XAxis
+            dataKey={xKey}
+            tick={hideXAxisLabels ? false : true}
+            axisLine={!hideXAxisLabels}
+            tickLine={!hideXAxisLabels}
+          />
+          <YAxis domain={yDomain} tickFormatter={(v) => (Number.isFinite(v) ? Math.round(v) : v)}/>
+          <Tooltip
+            formatter={(value) => {
+              if (typeof value === "number") return Number(value.toFixed(3));
+              return value;
+            }}
+          />
+          <Legend
+            wrapperStyle={{
+              fontWeight: 600,
+              fontSize: 13,
+              color: "#111827",
+              paddingBottom: 18,
+            }}
+          />
+
+          {ref ? (
+            <>
+              <ReferenceLine y={ref.center} stroke="#32CD32" strokeWidth={3} />
+              <ReferenceLine y={ref.upper} stroke="#ef4444" strokeWidth={1} strokeDasharray="4 4" />
+            </>
+          ) : null}
+
+          <Line type="monotone" dataKey={dataKey} dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
     </div>
   );
 }
