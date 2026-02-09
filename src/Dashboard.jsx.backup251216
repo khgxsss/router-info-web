@@ -1,0 +1,793 @@
+// src/Dashboard.jsx
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, ReferenceLine } from "recharts";
+
+// Nginx로 /api 프록시 사용
+const API = "";
+
+// 각 지표의 기준값(center)과 허용 편차(tol)
+const REF = {
+  rsrp: {
+    center: -100,
+    tol: 16,   // -100 + 16 = -84 (상한)
+  },
+  rsrq: {
+    center: -10,
+    tol: 4,    // -10 + 4 = -6
+  },
+  sinr: {
+    center: 15,
+    tol: 4,    // 15 + 4 = 19
+  },
+  router_rssi: {
+    center: -70,
+    tol: 14,   // -70 + 14 = -56
+  },
+};
+
+/** JSON 데이터에 대해 안정적인 해시값 계산 (djb2) */
+function hashJson(obj) {
+  let s;
+  try {
+    s = JSON.stringify(obj);
+  } catch {
+    s = String(obj ?? "");
+  }
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h) + s.charCodeAt(i); // h * 33 + c
+    h |= 0; // 32-bit
+  }
+  return h >>> 0; // unsigned
+}
+
+export default function Dashboard({ user, onLogout }) {
+  const [devices, setDevices] = useState([]);
+  const [msisdn, setMsisdn] = useState("");
+  const [tab, setTab] = useState("chart"); // 'chart' | 'table'
+
+  // --- 그래프 데이터 ---
+  const [days, setDays] = useState(7);
+  const [chartMode, setChartMode] = useState("recent"); // 'recent' | 'range'
+  const [chartStart, setChartStart] = useState(() => todayOffset(-7));
+  const [chartEnd, setChartEnd] = useState(() => todayOffset(0));
+  const [agg, setAgg] = useState("all"); // 'daily' | 'all'
+  const [daily, setDaily] = useState([]);
+
+  // --- 상세 표 데이터 ---
+  const [start, setStart] = useState(() => todayOffset(-7));
+  const [end, setEnd] = useState(() => todayOffset(0));
+  const [rows, setRows] = useState([]);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const pageSize = 200;
+
+  // 정렬(최신↔오래된)
+  const [order, setOrder] = useState("desc"); // 'desc' = 최신먼저
+
+  // --- 자동 새로고침 ---
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [refreshMs, setRefreshMs] = useState(60000); // 60s 기본
+  const [lastUpdated, setLastUpdated] = useState(null);
+
+  // fetch 취소용
+  const chartAbort = useRef(null);
+  const tableAbort = useRef(null);
+
+  // 이전 해시 저장용
+  const dailyHashRef = useRef(null);
+  const tableHashRef = useRef(null);
+  const totalRef = useRef(total);
+
+  // 휴면 여부
+  const [showDormant, setShowDormant] = useState(false);
+
+  // device 이름바꾼 뒤 드롭다운 닉네임 최신화
+  async function loadDevices(selectMsisdn = null) {
+    const url = `${API}/api/msisdns?include_dormant=${showDormant ? 1 : 0}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    const list = d.devices || [];
+    setDevices(list);
+
+    if (selectMsisdn) setMsisdn(selectMsisdn);
+    else if (!msisdn && list.length) setMsisdn(list[0].msisdn);
+  }
+
+  useEffect(() => {
+    loadDevices(msisdn || null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showDormant]);
+
+  // 디바이스 목록 1회 로드
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        if (!mounted) return;
+        await loadDevices(null);
+      } catch {}
+    })();
+    return () => { mounted = false; };
+  }, []);
+
+  // 개별 fetch 함수 (변경 시에만 상태 업데이트)
+  const fetchChart = async (force = false) => {
+    if (!msisdn) return false;
+    chartAbort.current?.abort?.();
+    const ac = new AbortController();
+    chartAbort.current = ac;
+    try {
+      let url;
+      if (chartMode === "recent") {
+        // ✅ 기존: 최근 N일
+        if (agg === "daily") {
+          url = `${API}/api/metrics/daily_avg?msisdn=${encodeURIComponent(msisdn)}&days=${days}`;
+        } else {
+          url = `${API}/api/metrics/raw?msisdn=${encodeURIComponent(msisdn)}&days=${days}`;
+        }
+      } else {
+        // ✅ 날짜 지정 모드: start/end 사용
+        if (!chartStart || !chartEnd) return false;
+        const qs = `msisdn=${encodeURIComponent(msisdn)}&start=${encodeURIComponent(chartStart)}&end=${encodeURIComponent(chartEnd)}`;
+        if (agg === "daily") {
+          url = `${API}/api/metrics/daily_avg?${qs}`;
+        } else {
+          url = `${API}/api/metrics/raw?${qs}`;
+        }
+      }
+      const r = await fetch(url, { signal: ac.signal });
+      const d = await r.json();
+      const data = d.data || [];
+      const h = hashJson({ agg, chartMode, chartStart, chartEnd, data });// 모드 포함하여 해시
+      if (force || h !== dailyHashRef.current) {
+        dailyHashRef.current = h;
+        setDaily(data);
+        return true;
+      }
+    } catch (_) {}
+    return false; // 변경 없음
+  };
+
+  const fetchTable = async (force = false) => {
+    if (!msisdn || !start || !end) return false;
+    tableAbort.current?.abort?.();
+    const ac = new AbortController();
+    tableAbort.current = ac;
+    try {
+      const r = await fetch(
+        `${API}/api/records?msisdn=${encodeURIComponent(msisdn)}&start=${encodeURIComponent(
+          start
+        )}&end=${encodeURIComponent(end)}&page=${page}&page_size=${pageSize}&order=${order}`,
+        { signal: ac.signal }
+      );
+      const d = await r.json();
+      const newRows = d.rows || [];
+      const newTotal = d.total || 0;
+      const h = hashJson(newRows);
+
+      const changed = force || h !== tableHashRef.current || newTotal !== totalRef.current;
+      if (changed) {
+        tableHashRef.current = h;
+        totalRef.current = newTotal;
+        setRows(newRows);
+        setTotal(newTotal);
+        return true; // 강제 또는 변경됨
+      }
+    } catch (_) {}
+    return false; // 변경 없음
+  };
+
+  async function handleEditAlias() {
+    if (!msisdn) return;
+    const current = devices.find(d => d.msisdn === msisdn)?.alias || "";
+    const next = window.prompt("이 기기의 별칭을 입력하세요 (비우면 제거):", current);
+    if (next === null) return; // 취소
+  
+    try {
+      const r = await fetch(`${API}/api/devices/alias`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ msisdn, alias: next })
+      });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.detail || "save failed");
+  
+      // 로컬 상태 즉시 갱신(드롭다운 라벨 반영) x => 서버에서 로드디바이스로 변경 2025.12.16 dhkim
+      // setDevices(prev => sortDevices(
+      //   prev.map(d => d.msisdn === msisdn ? { ...d, alias: j.alias || null } : d)
+      // ));
+      await loadDevices(msisdn);
+      
+      // 토스트 대신 alert 간단히
+      // alert("저장되었습니다.");
+    } catch (e) {
+      alert("별칭 저장 실패: " + (e?.message || e));
+    }
+  }  
+
+  async function handleDeleteDevice() {
+    if (!msisdn) return;
+    const dev = devices.find(d => d.msisdn === msisdn);
+    const label = dev?.alias ? `${msisdn} (${dev.alias})` : msisdn;
+    const ok = window.confirm(`정말로 기기 '${label}' 을(를) 목록에서 삭제할까요?\n(주의: 새 데이터가 들어오면 자동으로 다시 등록될 수 있습니다)`);
+    if (!ok) return;
+  
+    try {
+      const url = `${API}/api/devices?msisdn=${encodeURIComponent(msisdn)}`;
+      const r = await fetch(url, { method: "DELETE" });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.detail || "delete failed");
+  
+      // 로컬 목록에서 제거
+      setDevices(prev => prev.filter(d => d.msisdn !== msisdn));
+  
+      // 현재 선택이 삭제된 기기라면, 다른 기기로 자동 전환
+      setMsisdn(prev => {
+        if (prev !== msisdn) return prev;
+        const next = (devices.filter(d => d.msisdn !== msisdn)[0]?.msisdn) || "";
+        return next;
+      });
+  
+      // 표/그래프 리셋
+      setRows([]); setTotal(0); setDaily([]);
+    } catch (e) {
+      alert("기기 삭제 실패: " + (e?.message || e));
+    }
+  }
+
+  function sortDevices(list) {
+    return [...list].sort((a, b) => {
+      const an = (a.alias || "").trim();
+      const bn = (b.alias || "").trim();
+      const hasA = an.length > 0;
+      const hasB = bn.length > 0;
+      if (hasA && hasB) return an.localeCompare(bn, "ko-KR"); // 닉네임끼리 사전순
+      if (hasA) return -1;  // 닉네임 있는 기기 먼저
+      if (hasB) return 1;
+      return a.msisdn.localeCompare(b.msisdn); // 둘 다 없으면 msisdn 사전순
+    });
+  }  
+
+  // 최초/의존성 변경 시 즉시 로드
+  useEffect(() => {
+    if (!msisdn) return;
+    (async () => {
+      const changed = await fetchChart();
+      if (changed) setLastUpdated(new Date());
+    })();
+  }, [msisdn, days, agg, chartMode, chartStart, chartEnd]);
+
+  useEffect(() => {
+    if (!msisdn) return;
+    (async () => {
+      const changed = await fetchTable();
+      if (changed) setLastUpdated(new Date());
+    })();
+  }, [msisdn, start, end, page, order]);
+
+  // 자동 새로고침: 현재 탭만 갱신 + 탭 숨김 시 일시정지 + 변경 시에만 lastUpdated 갱신
+  useEffect(() => {
+    if (!autoRefresh) return;
+
+    const tick = async () => {
+      if (document.visibilityState === "hidden") return; // 숨김이면 스킵
+      let changed = false;
+      if (tab === "chart") {
+        changed = await fetchChart();
+      } else {
+        changed = await fetchTable();
+      }
+      if (changed) setLastUpdated(new Date());
+    };
+
+    // 즉시 1회 실행 후 interval 시작
+    tick();
+    const id = setInterval(tick, refreshMs);
+    return () => clearInterval(id);
+  }, [autoRefresh, refreshMs, tab, msisdn, days, agg, chartMode, chartStart, chartEnd, start, end, page, order]);
+
+
+
+  const isDailyEmpty = useMemo(() => (daily?.length || 0) === 0, [daily]);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  return (
+    <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif", padding: 16 }}>
+      {/* 상단 바 */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+        <h1 style={{ margin: 0 }}>Router Info Dashboard</h1>
+        {user ? <span style={{ opacity: 0.9 }}>{user} 님</span> : null}
+        {onLogout ? (
+          <button
+            onClick={onLogout}
+            style={{
+              marginLeft: "auto",
+              background: "#111827",
+              color: "#fff",
+              border: "1px solid #111827",
+              borderRadius: 6,
+              padding: "6px 10px",
+              cursor: "pointer",
+            }}
+          >
+            로그아웃
+          </button>
+        ) : null}
+      </div>
+
+      {/* 컨트롤 바 */}
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "center",
+          marginBottom: 16,
+          flexWrap: "wrap",
+          background: "#f8fafc",
+          padding: 12,
+          borderRadius: 8,
+          border: "1px solid #e5e7eb",
+        }}
+      >
+        <label>
+          기기(msisdn):{" "}
+          <select
+            value={msisdn}
+            onChange={(e) => {
+              setMsisdn(e.target.value);
+              setPage(1);
+            }}
+          >
+            {devices.map((d) => {
+              const label = `${d.msisdn}${d.alias ? ` (${d.alias})` : ""}`;
+              // 최근 24시간 데이터 없는 기기만 회색
+              const style = d.has_recent
+                ? { color: "#111827" } // 평소 진한 글자
+                : { color: "#9ca3af" }; // 회색 (비활성처럼 보이게)
+              return (
+                <option key={d.msisdn} value={d.msisdn} style={style}>
+                  {label}
+                </option>
+              );
+            })}
+          </select>
+        </label>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setTab("chart")} style={tabBtn(tab === "chart")}>
+            그래프
+          </button>
+          <button onClick={() => setTab("table")} style={tabBtn(tab === "table")}>
+            상세
+          </button>
+        </div>
+
+        <div style={{ width: 1, height: 24, background: "#e5e7eb" }} />
+
+        {/* 자동 새로고침 컨트롤 */}
+        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
+          자동 새로고침
+        </label>
+        <label>
+          주기:{" "}
+          <select value={refreshMs} onChange={(e) => setRefreshMs(Number(e.target.value))}>
+            <option value={10000}>10초</option>
+            <option value={15000}>15초</option>
+            <option value={30000}>30초</option>
+            <option value={60000}>60초</option>
+          </select>
+        </label>
+        <button
+          onClick={async () => {
+          if (tab === "chart") {
+            await fetchChart(true);   // 강제 갱신
+          } else {
+            await fetchTable(true);   // 강제 갱신
+          }
+          setLastUpdated(new Date()); // 해시와 무관하게 갱신 시간 표기
+          }}
+          style={{
+            padding: "6px 10px",
+            borderRadius: 8,
+            border: "1px solid #2563eb",
+            background: "#2563eb",
+            color: "#fff",
+            fontWeight: 600,
+            cursor: "pointer"
+          }}
+          title="지금 즉시 새로고침"
+        >
+          지금 새로고침
+        </button>
+
+        <button onClick={handleEditAlias} style={{ padding:"8px 12px", borderRadius:8, border:"1px solid #111", background:"#fff", cursor:"pointer" }}>
+          기기별명
+        </button>
+        <button
+          className="btn-danger"
+          onClick={handleDeleteDevice}
+          title="현재 선택한 기기를 목록에서 삭제합니다"
+        >
+          기기삭제
+        </button>
+        <label style={{ marginLeft: 12 }}>
+          <input
+            type="checkbox"
+            checked={showDormant}
+            onChange={(e) => setShowDormant(e.target.checked)}
+          />
+          {" "}휴면 기기 보기
+        </label>
+
+        {lastUpdated && (
+          <span style={{ marginLeft: "auto", fontSize: 12, color: "#6b7280" }}>
+            마지막 갱신: {fmtTime(lastUpdated)}
+          </span>
+        )}
+      </div>
+
+      {/* 본문 */}
+      {tab === "chart" ? (
+        <>
+          <div
+            style={{
+              marginBottom: 12,
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <span>데이터 구간 보기:</span>
+            <select
+              value={chartMode}
+              onChange={(e) => {
+                const v = e.target.value;
+                setChartMode(v);
+                // 모드 바꿀 때 페이지 리셋 느낌으로 차트도 새로고침
+              }}
+            >
+              <option value="recent">최근</option>
+              <option value="range">날짜 지정</option>
+            </select>
+
+            {chartMode === "recent" ? (
+              <>
+                <span>최근</span>
+                <select value={days} onChange={(e) => setDays(Number(e.target.value))}>
+                  {[7, 14, 30].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+                <span>일</span>
+              </>
+            ) : (
+              <>
+                <span>기간</span>
+                <input
+                  type="date"
+                  value={chartStart}
+                  onChange={(e) => setChartStart(e.target.value)}
+                />
+                <span>~</span>
+                <input
+                  type="date"
+                  value={chartEnd}
+                  onChange={(e) => setChartEnd(e.target.value)}
+                />
+              </>
+            )}
+
+            <span>/</span>
+            <select value={agg} onChange={(e) => setAgg(e.target.value)}>
+              <option value="daily">일별 평균</option>
+              <option value="all">모든 데이터</option>
+            </select>
+          </div>
+
+          {isDailyEmpty ? (
+            <div style={{ padding: 12, color: "#666" }}>최근 데이터가 없습니다. 기간을 늘려 보세요.</div>
+          ) : (
+            <>
+              <MetricChart title="RSRP (dBm)" data={daily} dataKey={agg === "daily" ? "rsrp_avg" : "rsrp"} metric="rsrp" xKey={agg === "daily" ? "d" : "ts"} />
+              <MetricChart title="RSRQ (dB)"  data={daily} dataKey={agg === "daily" ? "rsrq_avg" : "rsrq"} metric="rsrq" xKey={agg === "daily" ? "d" : "ts"} />
+              <MetricChart title="SINR (dB)"  data={daily} dataKey={agg === "daily" ? "sinr_avg" : "sinr"} metric="sinr" xKey={agg === "daily" ? "d" : "ts"} />
+              <MetricChart title="Router RSSI (dBm)" data={daily} dataKey={agg === "daily" ? "router_rssi_avg" : "router_rssi"} metric="router_rssi" xKey={agg === "daily" ? "d" : "ts"} />
+            </>
+          )}
+        </>
+      ) : (
+        <>
+          <div style={{ display: "flex", gap: 12, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <div>
+              시작일:{" "}
+              <input
+                type="date"
+                value={start}
+                onChange={(e) => {
+                  setStart(e.target.value);
+                  setPage(1);
+                }}
+              />
+            </div>
+            <div>
+              종료일:{" "}
+              <input
+                type="date"
+                value={end}
+                onChange={(e) => {
+                  setEnd(e.target.value);
+                  setPage(1);
+                }}
+              />
+            </div>
+
+            {/* 정렬 토글 */}
+            <button
+              onClick={() => {
+                setOrder((prev) => (prev === "desc" ? "asc" : "desc"));
+                setPage(1);
+              }}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 8,
+                border: "1px solid #111827",
+                background: "#fff",
+                color: "#111827",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+              title="정렬 순서 토글 (최신↔오래된)"
+            >
+              정렬: {order === "desc" ? "최신 → 오래된" : "오래된 → 최신"}
+            </button>
+
+            {/* CSV 다운로드 (정렬 반영) */}
+            <button
+              onClick={() => {
+                if (!msisdn || !start || !end) return;
+                const url = `${API}/api/records/csv?msisdn=${encodeURIComponent(
+                  msisdn
+                )}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&order=${order}`;
+                window.open(url, "_blank");
+              }}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #2563eb", background: "#2563eb", color: "#fff", fontWeight: 600, cursor: "pointer" }}
+            >
+              CSV 다운로드
+            </button>
+          </div>
+
+          <div
+            style={{
+              overflow: "auto",
+              border: "1px solid #cbd5e1",
+              borderRadius: 10,
+              maxHeight: 1000,
+              boxShadow: "0 1px 2px rgba(0,0,0,0.06)",
+            }}
+          >
+            <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 13 }}>
+              <thead>
+                <tr>{headers.map((h) => <th key={h} style={th}>{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={headers.length} style={{ padding: 16, textAlign: "center", color: "#6b7280" }}>
+                      해당 기간 데이터가 없습니다.
+                    </td>
+                  </tr>
+                ) : (
+                  rows.map((r, idx) => {
+                    const zebra = idx % 2 === 0 ? "#ffffff" : "#f9fafb";
+                    return (
+                      <tr
+                        key={r.id}
+                        style={{ background: zebra, transition: "background 0.15s ease" }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "#eef2ff")}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = zebra)}
+                      >
+                        {headers.map((h) => (
+                          <td key={h} style={td}>
+                            {fmt(r, h)}
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
+            <button disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+              이전
+            </button>
+            <span>
+              {page} / {Math.max(1, Math.ceil(total / pageSize))} (총 {total}건)
+            </span>
+            <button disabled={page >= Math.max(1, Math.ceil(total / pageSize))} onClick={() => setPage((p) => p + 1)}>
+              다음
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** 개별 지표 차트 */
+/** 개별 지표 차트 */
+function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
+  const hideXAxisLabels = xKey === "ts";
+  // 기준/상한 정보
+  const ref = REF[metric];
+
+  // 기준선을 차트 정중앙에 오도록 Y 도메인을 기준값 중심 대칭으로 설정
+  let yDomain = undefined;
+  if (ref) {
+    const vals = (data || [])
+      .map((d) => d?.[dataKey])
+      .filter((v) => typeof v === "number" && !Number.isNaN(v));
+    if (vals.length) {
+      const dataMin = Math.min(...vals);
+      const dataMax = Math.max(...vals);
+      const center = ref.center;
+      const boundaryMax = center + ref.tol;      // 상한
+      const boundaryMin = center - ref.tol;      // 이건 도메인 계산용(대칭)
+
+      const delta = Math.max(
+        Math.abs(dataMax - center),
+        Math.abs(center - dataMin),
+        Math.abs(boundaryMax - center),
+        Math.abs(center - boundaryMin)
+      );
+      const pad = Math.max(delta * 0.05, 1);
+      yDomain = [center - (delta + pad), center + (delta + pad)];
+    } else {
+      // 데이터 없으면 기준±tol만 포함
+      yDomain = [ref.center - ref.tol, ref.center + ref.tol];
+    }
+  }
+
+  return (
+    <div
+      style={{
+        height: 240,
+        marginBottom: 24,
+        border: "1px solid #eee",
+        borderRadius: 8,
+        padding: 12,
+      }}
+    >
+      <div style={{ marginBottom: 6, fontWeight: 600 }}>{title}</div>
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={data}>
+          <CartesianGrid strokeDasharray="4 4" />
+          <XAxis
+            dataKey={xKey}
+            tick={hideXAxisLabels ? false : true}
+            axisLine={!hideXAxisLabels}
+            tickLine={!hideXAxisLabels}
+          />
+          <YAxis domain={yDomain} />
+          <Tooltip formatter={(value) => {
+            if (typeof value === "number") {
+              return Number(value.toFixed(3)); // 소수점 3자리 반올림
+            }
+            return value;
+          }} />
+          <Legend
+            wrapperStyle={{
+              fontWeight: 500,
+              fontSize: 13,
+              color: "#111827",
+              paddingBottom: 20,
+            }}
+          />
+          {/* 기준선/상한선만 표시 */}
+          {ref && (
+            <>
+              {/* 기준값: 연두색 굵은 선 */}
+              <ReferenceLine y={ref.center} stroke="#32CD32" strokeWidth={3} />
+              {/* 상한: 빨간 얇은 점선 */}
+              <ReferenceLine
+                y={ref.center + ref.tol}
+                stroke="#ef4444"
+                strokeWidth={1}
+                strokeDasharray="4 4"
+              />
+              {/* 🔻 하한선은 더 이상 없음 */}
+            </>
+          )}
+          {/* 실제 데이터 라인 */}
+          <Line type="monotone" dataKey={dataKey} dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+
+/* ---------- 유틸/스타일 ---------- */
+
+const headers = [
+  "ts_kst",
+  "datetime_str",
+  "system",
+  "plmn",
+  "band",
+  "earfcn_dl",
+  "earfcn_ul",
+  "bandwidth",
+  "cell_id",
+  "pci",
+  "drx",
+  "rsrp",
+  "rsrq",
+  "rssi",
+  "tac",
+  "sinr",
+  "rrc_st",
+  "emc_st",
+  "scell_band",
+  "scell_bw",
+  "scell_status",
+  "latitude",
+  "longitude",
+  "ip_v4",
+  "dl_mbps",
+  "ul_mbps",
+  "router_rssi",
+  "router_temp_c",
+];
+
+function fmt(row, key) {
+  return row?.[key] ?? "";
+}
+function todayOffset(n) {
+  const d = new Date();
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function fmtTime(d) {
+  const pad = (x) => String(x).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function tabBtn(active) {
+  return {
+    padding: "8px 14px",
+    borderRadius: 8,
+    border: active ? "2px solid #2b6cb0" : "1px solid #999",
+    background: active ? "#2b6cb0" : "#f7f7f7",
+    color: active ? "#fff" : "#333",
+    fontWeight: active ? 600 : 400,
+    cursor: "pointer",
+    transition: "all 0.2s ease-in-out",
+  };
+}
+
+const th = {
+  position: "sticky",
+  top: 0,
+  background: "#1f2937",
+  color: "#ffffff",
+  borderBottom: "1px solid #0f172a",
+  padding: "10px 12px",
+  textAlign: "left",
+  fontWeight: 700,
+  fontSize: 13,
+  letterSpacing: 0.2,
+};
+
+const td = {
+  padding: "9px 12px",
+  borderBottom: "1px solid #e5e7eb",
+  color: "#111827",
+  fontSize: 13,
+};

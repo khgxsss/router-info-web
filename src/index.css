@@ -1,0 +1,27 @@
+.btn-danger {
+    display:inline-flex; align-items:center; justify-content:center;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid #dc2626;
+    background: #ef4444;
+    color: #fff;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform .06s ease, box-shadow .15s ease, background-color .15s ease, opacity .15s ease;
+    user-select: none;
+}
+.btn-danger:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 14px rgba(0,0,0,0.10);
+}
+.btn-danger:active {
+  transform: translateY(0);
+  box-shadow: 0 3px 8px rgba(0,0,0,0.08);
+  background: #dc2626;
+}
+.btn-danger:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
