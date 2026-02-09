@@ -1,0 +1,895 @@
+import os
+import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import csv
+import io
+
+from sanic import Sanic, response
+from sanic.request import Request
+from sanic.exceptions import InvalidUsage
+from sanic.exceptions import SanicException
+
+try:
+    import aiofiles           # 파일 비동기쓰기
+    import aiomysql           # MySQL 비동기
+except ImportError:
+    raise SystemExit("`pip install aiofiles aiomysql` 를 먼저 실행하세요.")
+
+APP_NAME = "RawBodyDailyLogger"
+LOG_DIR = os.environ.get("LOG_DIR", "/home/rcn01/router_info")
+KST = ZoneInfo("Asia/Seoul")  # GMT+9
+
+# ====== MySQL 연결 정보 (환경변수 사용 권장) ======
+DB_HOST = os.environ.get("DB_HOST", "14.50.159.2")
+DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+DB_USER = os.environ.get("DB_USER", "rcn")
+DB_PASS = os.environ.get("DB_PASS", "rcn01!0301")
+DB_NAME = os.environ.get("DB_NAME", "ROUTER_INFO")  # 요청대로 DB 이름 변경
+
+app = Sanic(APP_NAME)
+
+@app.exception(Exception)
+async def handle_ex(request, exc):
+    ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+    msg = f"[{ts}] UNHANDLED: {repr(exc)}\n"
+    try:
+        async with aiofiles.open(os.path.join(app.ctx.log_dir, f"{datetime.now(tz=KST).strftime('%Y%m%d')}.log"), "ab") as f:
+            await f.write(msg.encode())
+    except:
+        pass
+    return response.json({"error": "internal_error", "detail": repr(exc)}, status=500)
+
+
+@app.listener("before_server_start")
+async def before_start(app, _):
+    # 로그 디렉토리 준비
+    os.makedirs(LOG_DIR, exist_ok=True)
+    app.ctx.log_dir = LOG_DIR
+
+    # MySQL 커넥션 풀
+    app.ctx.pool = await aiomysql.create_pool(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        db=DB_NAME,
+        autocommit=True,
+        minsize=1,
+        maxsize=10,
+        charset="utf8mb4",
+    )
+
+
+@app.listener("after_server_stop")
+async def after_stop(app, _):
+    pool = getattr(app.ctx, "pool", None)
+    if pool:
+        pool.close()
+        await pool.wait_closed()
+
+async def append_raw(body: bytes, log_dir: str, ts_kst: datetime):
+    """요청 바디 앞에 KST 타임스탬프 붙여서 파일에 append."""
+    date_str = ts_kst.strftime("%Y%m%d")
+    ts_str = ts_kst.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join(log_dir, f"{date_str}.log")
+    async with aiofiles.open(path, "ab") as f:
+        line = f"[{ts_str}] ".encode() + (body or b"")
+        if not line.endswith(b"\n"):
+            line += b"\n"
+        await f.write(line)
+
+
+async def insert_db(request: Request, ts_kst: datetime, body: bytes):
+    """
+    JSON이면 각 필드 매핑하여 router_info에 INSERT.
+    JSON 파싱 실패면 raw_text에 원문 저장.
+    """
+    pool = app.ctx.pool
+    client_ip = request.remote_addr or None
+    ts_str = ts_kst.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 기본 row dict
+    row = {
+        "ts_kst": ts_str,
+        "datetime_str": None,
+        "msisdn": None,
+        "system": None,
+        "plmn": None,
+        "band": None,
+        "earfcn_dl": None,
+        "earfcn_ul": None,
+        "bandwidth": None,
+        "cell_id": None,
+        "pci": None,
+        "drx": None,
+        "rsrp": None,
+        "rsrq": None,
+        "rssi": None,
+        "tac": None,
+        "sinr": None,
+        "rrc_st": None,
+        "emc_st": None,
+        "scell_band": None,
+        "scell_bw": None,
+        "scell_status": None,
+        "latitude": None,
+        "longitude": None,
+        "ip_v4": None,
+        "client_ip": client_ip,
+        "raw_json": None,   # 문자열(JSON)로 저장
+        "raw_text": None,
+    }
+
+    # JSON 파싱
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        # 들어온 JSON 키 그대로 매핑 (대소문자 유지)
+        row["datetime_str"] = payload.get("DATETIME")
+        row["msisdn"]       = payload.get("MSISDN")
+        row["system"]       = payload.get("SYSTEM")
+        row["plmn"]         = payload.get("PLMN")
+        row["band"]         = payload.get("Band")
+        row["earfcn_dl"]    = payload.get("EARFCN_DL")
+        row["earfcn_ul"]    = payload.get("EARFCN_UL")
+        row["bandwidth"]    = payload.get("Bandwidth")
+        row["cell_id"]      = payload.get("Cell_ID")
+        row["pci"]          = payload.get("PCI")
+        row["drx"]          = payload.get("DRX")
+        row["rsrp"]         = payload.get("RSRP")
+        row["rsrq"]         = payload.get("RSRQ")
+        row["rssi"]         = payload.get("RSSI")
+        row["tac"]          = payload.get("TAC")
+        row["sinr"]         = payload.get("SINR")
+        row["rrc_st"]       = payload.get("RRC_ST")
+        row["emc_st"]       = payload.get("EMC_ST")
+        row["scell_band"]   = payload.get("SCELL_BAND")
+        row["scell_bw"]     = payload.get("SCELL_BW")
+        row["scell_status"] = payload.get("SCELL_STATUS")
+        row["latitude"]     = payload.get("LATITUDE")
+        row["longitude"]    = payload.get("LONGITUDE")
+        row["ip_v4"]        = payload.get("IP_v4")
+        # 원본 JSON 문자열 보관(이모지/한글 보존)
+        row["raw_json"]     = json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        # JSON이 아니면 원문을 raw_text에 저장
+        row["raw_text"]     = body.decode("utf-8", errors="replace")
+
+    sql = """
+    INSERT INTO `router_info` (
+      `ts_kst`, `datetime_str`, `msisdn`, `system`, `plmn`, `band`,
+      `earfcn_dl`, `earfcn_ul`, `bandwidth`, `cell_id`, `pci`, `drx`,
+      `rsrp`, `rsrq`, `rssi`, `tac`, `sinr`, `rrc_st`, `emc_st`,
+      `scell_band`, `scell_bw`, `scell_status`, `latitude`, `longitude`,
+      `ip_v4`, `client_ip`, `raw_json`, `raw_text`
+    ) VALUES (
+      %(ts_kst)s, %(datetime_str)s, %(msisdn)s, %(system)s, %(plmn)s, %(band)s,
+      %(earfcn_dl)s, %(earfcn_ul)s, %(bandwidth)s, %(cell_id)s, %(pci)s, %(drx)s,
+      %(rsrp)s, %(rsrq)s, %(rssi)s, %(tac)s, %(sinr)s, %(rrc_st)s, %(emc_st)s,
+      %(scell_band)s, %(scell_bw)s, %(scell_status)s, %(latitude)s, %(longitude)s,
+      %(ip_v4)s, %(client_ip)s, %(raw_json)s, %(raw_text)s
+    )
+    """
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            # 1) devices 자동 등록 (VALUES() 폐기 → alias 방식)
+            if row["msisdn"]:
+                #25.12.16 kdh
+                # await cur.execute(
+                #     "INSERT IGNORE INTO devices (msisdn) VALUES (%s) AS new "
+                #     "ON DUPLICATE KEY UPDATE msisdn = new.msisdn",
+                #     (row["msisdn"],)
+                # )
+                await cur.execute(
+                    """
+                    INSERT INTO devices (msisdn, dormant, dormant_at) VALUES (%s, 0, NULL) AS new
+                    ON DUPLICATE KEY UPDATE
+                    msisdn = new.msisdn,
+                    dormant = 0,
+                    dormant_at = NULL
+                    """,
+                    (row["msisdn"],)
+                )
+            # 2) router_info 본문 INSERT 실행 (← 이게 빠져 있었음)
+            await cur.execute(sql, row)
+
+
+# 라우트 이름(name) 명시하여 중복 방지
+@app.route("/<path:path>", methods=["POST", "PUT", "PATCH"], name="log_any_path")
+@app.route("/", methods=["POST", "PUT", "PATCH"], name="log_any_root")
+async def log_any(request: Request, path: str = ""):
+    ts_kst = datetime.now(tz=KST)
+    body = request.body or b""
+
+    # 1) 파일 로그
+    await append_raw(body, app.ctx.log_dir, ts_kst)
+
+    # 2) DB 저장 (에러 나도 응답은 OK, 파일로그에만 남김)
+    try:
+        await insert_db(request, ts_kst, body)
+    except Exception as e:
+        err = f"[{ts_kst.strftime('%Y-%m-%d %H:%M:%S')}] DB_ERROR: {repr(e)}\n"
+        async with aiofiles.open(os.path.join(app.ctx.log_dir, f"{ts_kst.strftime('%Y%m%d')}.log"), "ab") as f:
+            await f.write(err.encode())
+
+    return response.text("ok\n")
+
+# 1) 기기 리스트
+
+# 25.12.16 kdh
+#@app.get("/api/msisdns", name="list_msisdns")
+# async def list_msisdns(_):
+#     # KST 기준 최근 24시간 컷오프
+#     cutoff_dt = (datetime.now(tz=KST) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+#     sql = """
+#     SELECT
+#       d.msisdn,
+#       d.alias,
+#       EXISTS(
+#         SELECT 1 FROM router_info r
+#         WHERE r.msisdn = d.msisdn
+#           AND r.ts_kst >= %s
+#       ) AS has_recent
+#     FROM devices d
+#     /* 닉네임이 있는 기기가 먼저, 닉네임끼리는 사전순, 닉네임 없는 기기는 맨 뒤에서 msisdn 사전순 */
+#     ORDER BY
+#       CASE WHEN d.alias IS NULL OR d.alias = '' THEN 1 ELSE 0 END ASC,
+#       d.alias ASC,
+#       d.msisdn ASC
+#     """
+
+#     async with app.ctx.pool.acquire() as conn:
+#         async with conn.cursor(aiomysql.DictCursor) as cur:
+#             await cur.execute(sql, (cutoff_dt,))
+#             rows = await cur.fetchall()
+
+#     # has_recent을 bool로 변환해서 내려주기
+#     devices = [{"msisdn": r["msisdn"], "alias": r["alias"], "has_recent": bool(r["has_recent"])} for r in rows] 
+#     return response.json({"devices": devices})
+
+@app.get("/api/msisdns", name="list_msisdns")
+async def list_msisdns(req: Request):
+    include_dormant = (req.args.get("include_dormant", "0") in ("1", "true", "yes"))
+
+    # KST 기준 최근 24시간 컷오프
+    cutoff_dt = (datetime.now(tz=KST) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+    where_dormant = "" if include_dormant else "WHERE d.dormant = 0"
+
+    sql = f"""
+    SELECT
+      d.msisdn,
+      d.alias,
+      d.dormant,
+      EXISTS(
+        SELECT 1 FROM router_info r
+        WHERE r.msisdn = d.msisdn
+          AND r.ts_kst >= %s
+      ) AS has_recent
+    FROM devices d
+    {where_dormant}
+    ORDER BY
+      CASE WHEN d.alias IS NULL OR d.alias = '' THEN 1 ELSE 0 END ASC,
+      d.alias ASC,
+      d.msisdn ASC
+    """
+
+    async with app.ctx.pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(sql, (cutoff_dt,))
+            rows = await cur.fetchall()
+
+    devices = [{
+        "msisdn": r["msisdn"],
+        "alias": r["alias"],
+        "dormant": bool(r["dormant"]),
+        "has_recent": bool(r["has_recent"]),
+    } for r in rows]
+
+    return response.json({"devices": devices})
+
+
+# 2) 최근 N일(기본 7일) 일별 평균
+#   /api/metrics/daily_avg?msisdn=0123&days=7
+@app.get("/api/metrics/daily_avg", name="daily_avg")
+async def daily_avg(req: Request):
+    msisdn = req.args.get("msisdn")
+    raw_days = (req.args.get("days", "7") or "7").strip()
+    # "7일" 같은 케이스 방어(숫자/점만 남김)
+    # raw_days = "".join(ch for ch in raw_days if (ch.isdigit() or ch == "."))
+    days = int(float(raw_days or 7))
+    # days = max(1, min(days, 365))  # 상한도 걸어두기(선택)
+    start = req.args.get("start")  # YYYY-MM-DD (옵션)
+    end   = req.args.get("end")    # YYYY-MM-DD (옵션)
+
+    if not msisdn:
+        raise InvalidUsage("msisdn is required")
+
+    # ✅ start/end가 들어오면 날짜 범위 사용, 아니면 days 기반 최근 N일
+    if start and end:
+        sql = r"""
+        SELECT
+          DATE(`ts_kst`) AS d,
+          AVG(CAST(NULLIF(`rsrp`,'')  AS DECIMAL(10,3))) AS rsrp_avg,
+          AVG(CAST(NULLIF(`rsrq`,'')  AS DECIMAL(10,3))) AS rsrq_avg,
+          AVG(CAST(NULLIF(`sinr`,'')  AS DECIMAL(10,3))) AS sinr_avg,
+          AVG(CAST(NULLIF(`rssi`,'')  AS DECIMAL(10,3))) AS router_rssi_avg,
+          NULL AS dl_mbps_avg,
+          NULL AS ul_mbps_avg,
+          NULL AS router_temp_avg
+        FROM `router_info`
+        WHERE `msisdn` = %s
+          AND `ts_kst` >= %s
+          AND `ts_kst` < DATE_ADD(%s, INTERVAL 1 DAY)
+        GROUP BY DATE(`ts_kst`)
+        ORDER BY DATE(`ts_kst`);
+        """
+        params = (msisdn, start, end)
+    else:
+        sql = r"""
+        SELECT
+          DATE(`ts_kst`) AS d,
+          AVG(CAST(NULLIF(`rsrp`,'')  AS DECIMAL(10,3))) AS rsrp_avg,
+          AVG(CAST(NULLIF(`rsrq`,'')  AS DECIMAL(10,3))) AS rsrq_avg,
+          AVG(CAST(NULLIF(`sinr`,'')  AS DECIMAL(10,3))) AS sinr_avg,
+          AVG(CAST(NULLIF(`rssi`,'')  AS DECIMAL(10,3))) AS router_rssi_avg,
+          NULL AS dl_mbps_avg,
+          NULL AS ul_mbps_avg,
+          NULL AS router_temp_avg
+        FROM `router_info`
+        WHERE `msisdn` = %s
+          AND `ts_kst` >= (CURRENT_DATE - INTERVAL %s DAY)
+        GROUP BY DATE(`ts_kst`)
+        ORDER BY DATE(`ts_kst`);
+        """
+        params = (msisdn, days)
+
+    try:
+        async with app.ctx.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql, params)
+                rows = await cur.fetchall()
+
+        # d: date → string, 수치값 → float
+        for r in rows:
+            if hasattr(r.get("d"), "strftime"):
+                r["d"] = r["d"].strftime("%Y-%m-%d")
+            for k in ("rsrp_avg", "rsrq_avg", "sinr_avg", "router_rssi_avg",
+                      "dl_mbps_avg", "ul_mbps_avg", "router_temp_avg"):
+                v = r.get(k)
+                if v is not None:
+                    r[k] = float(v)
+
+        return response.json({"msisdn": msisdn, "days": days, "start": start, "end": end, "data": rows})
+    except Exception as e:
+        ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+        async with aiofiles.open(os.path.join(app.ctx.log_dir, f"{datetime.now(tz=KST).strftime('%Y%m%d')}.log"), "ab") as f:
+            await f.write(f"[{ts}] DAILY_AVG_ERROR {repr(e)}\n".encode())
+        return response.json({"error": "query_failed", "detail": repr(e)}, status=500)
+
+# 2-1 원시 시계열 그래프
+
+
+# 2-1) 최근 N일(기본 7일) 시간별 평균
+#   /api/metrics/hourly_avg?msisdn=0123&start=2025-12-01&end=2025-12-18
+#   /api/metrics/hourly_avg?msisdn=0123&days=7
+@app.get("/api/metrics/hourly_avg", name="hourly_avg")
+async def hourly_avg(req: Request):
+    msisdn = req.args.get("msisdn")
+    raw_days = (req.args.get("days", "7") or "7").strip()
+    # "7일" 같은 입력 방어: 숫자/점만 남김 (필요하면 사용)
+    # raw_days = "".join(ch for ch in raw_days if (ch.isdigit() or ch == "."))
+    days = int(float(raw_days or 7))
+
+    start = req.args.get("start")  # YYYY-MM-DD (옵션)
+    end   = req.args.get("end")    # YYYY-MM-DD (옵션)
+
+    if not msisdn:
+        raise InvalidUsage("msisdn is required")
+
+    # 시간 버킷 표현식: SELECT/GROUP BY/ORDER BY 모두 동일하게 사용
+    # (only_full_group_by 안전)
+    if start and end:
+        sql = r"""
+        SELECT
+          DATE_FORMAT(`ts_kst`, '%%Y-%%m-%%d %%H:00:00') AS h,
+          AVG(CAST(NULLIF(`rsrp`,'')  AS DECIMAL(10,3))) AS rsrp_avg,
+          AVG(CAST(NULLIF(`rsrq`,'')  AS DECIMAL(10,3))) AS rsrq_avg,
+          AVG(CAST(NULLIF(`sinr`,'')  AS DECIMAL(10,3))) AS sinr_avg,
+          AVG(CAST(NULLIF(`rssi`,'')  AS DECIMAL(10,3))) AS router_rssi_avg,
+          NULL AS dl_mbps_avg,
+          NULL AS ul_mbps_avg,
+          NULL AS router_temp_avg
+        FROM `router_info`
+        WHERE `msisdn` = %s
+          AND `ts_kst` >= %s
+          AND `ts_kst` < DATE_ADD(%s, INTERVAL 1 DAY)
+        GROUP BY h
+        ORDER BY h ASC;
+        """
+        params = (msisdn, start, end)
+    else:
+        sql = r"""
+        SELECT
+          DATE_FORMAT(`ts_kst`, '%%Y-%%m-%%d %%H:00:00') AS h,
+          AVG(CAST(NULLIF(`rsrp`,'')  AS DECIMAL(10,3))) AS rsrp_avg,
+          AVG(CAST(NULLIF(`rsrq`,'')  AS DECIMAL(10,3))) AS rsrq_avg,
+          AVG(CAST(NULLIF(`sinr`,'')  AS DECIMAL(10,3))) AS sinr_avg,
+          AVG(CAST(NULLIF(`rssi`,'')  AS DECIMAL(10,3))) AS router_rssi_avg,
+          NULL AS dl_mbps_avg,
+          NULL AS ul_mbps_avg,
+          NULL AS router_temp_avg
+        FROM `router_info`
+        WHERE `msisdn` = %s
+          AND `ts_kst` >= (CURRENT_TIMESTAMP - INTERVAL %s DAY)
+        GROUP BY h
+        ORDER BY h ASC;
+        """
+        params = (msisdn, days)
+
+    try:
+        async with app.ctx.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql, params)
+                rows = await cur.fetchall()
+
+        # JSON 직렬화(Decimal -> float)
+        for r in rows:
+            for k in (
+                "rsrp_avg", "rsrq_avg", "sinr_avg", "router_rssi_avg",
+                "dl_mbps_avg", "ul_mbps_avg", "router_temp_avg"
+            ):
+                v = r.get(k)
+                if v is not None:
+                    r[k] = float(v)
+
+        return response.json({
+            "msisdn": msisdn,
+            "days": days,
+            "start": start,
+            "end": end,
+            "data": rows
+        })
+    except Exception as e:
+        ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+        async with aiofiles.open(
+            os.path.join(app.ctx.log_dir, f"{datetime.now(tz=KST).strftime('%Y%m%d')}.log"),
+            "ab"
+        ) as f:
+            await f.write(f"[{ts}] HOURLY_AVG_ERROR {repr(e)}\n".encode())
+        return response.json({"error": "query_failed", "detail": repr(e)}, status=500)
+
+@app.get("/api/metrics/raw", name="metrics_raw")
+async def metrics_raw(req: Request):
+    """
+    최근 N일 또는 지정 범위의 원시 시계열 데이터 + 누락 구간 임의 생성.
+
+    Query:
+      - msisdn: 필수
+      - days  : 기본 7 (recent 모드)
+      - start, end: YYYY-MM-DD (range 모드)
+
+    임의 생성 규칙:
+      - 내부 구간: (다음실제시간 - 이전실제시간) / 5분  => 그 값에서 -1 한 개수만큼 생성
+      - 마지막 구간:
+          * recent 모드: (현재시간 - 마지막실제시간) / 5분  => -1 개
+          * range 모드: (범위종료시간( end+1일 ) - 마지막실제시간) / 5분  => -1 개
+      - 임의 생성 값:
+          RSRP = -125, RSRQ = -15, SINR = 5, RSSI = -100
+    """
+    msisdn = req.args.get("msisdn")
+    days   = int(req.args.get("days", "7"))
+    start  = req.args.get("start")
+    end    = req.args.get("end")
+
+    if not msisdn:
+        raise InvalidUsage("msisdn is required")
+
+    # 1) 조회 구간 SQL / 파라미터 결정
+    if start and end:
+        # 날짜 지정 모드: [start, end+1일) 구간
+        sql = """
+        SELECT
+          ts_kst,
+          CAST(NULLIF(rsrp,'')  AS DECIMAL(10,3)) AS rsrp,
+          CAST(NULLIF(rsrq,'')  AS DECIMAL(10,3)) AS rsrq,
+          CAST(NULLIF(sinr,'')  AS DECIMAL(10,3)) AS sinr,
+          CAST(NULLIF(rssi,'')  AS DECIMAL(10,3)) AS router_rssi
+        FROM router_info
+        WHERE msisdn = %s
+          AND ts_kst >= %s
+          AND ts_kst < DATE_ADD(%s, INTERVAL 1 DAY)
+        ORDER BY ts_kst ASC
+        """
+        params = (msisdn, start, end)
+        # tail 채워 넣을 때 사용할 “끝 경계”
+        try:
+            range_end_boundary = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=KST) + timedelta(days=1)
+        except Exception:
+            range_end_boundary = datetime.now(tz=KST)
+    else:
+        # 최근 N일 모드: now- N일 ~ now
+        cutoff = (datetime.now(tz=KST) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        sql = """
+        SELECT
+          ts_kst,
+          CAST(NULLIF(rsrp,'')  AS DECIMAL(10,3)) AS rsrp,
+          CAST(NULLIF(rsrq,'')  AS DECIMAL(10,3)) AS rsrq,
+          CAST(NULLIF(sinr,'')  AS DECIMAL(10,3)) AS sinr,
+          CAST(NULLIF(rssi,'')  AS DECIMAL(10,3)) AS router_rssi
+        FROM router_info
+        WHERE msisdn = %s
+          AND ts_kst >= %s
+        ORDER BY ts_kst ASC
+        """
+        params = (msisdn, cutoff)
+        range_end_boundary = datetime.now(tz=KST)
+
+    try:
+        async with app.ctx.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql, params)
+                rows = await cur.fetchall()
+
+        # 2) 기본 포인트: 실제 수신값
+        def to_float(v):
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        raw_points = []
+        for r in rows:
+            ts_dt = r["ts_kst"]
+            # 혹시 timezone 없는 datetime이면 KST 붙여주기
+            if isinstance(ts_dt, datetime) and ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=KST)
+            raw_points.append({
+                "ts": ts_dt,
+                "rsrp": to_float(r.get("rsrp")),
+                "rsrq": to_float(r.get("rsrq")),
+                "sinr": to_float(r.get("sinr")),
+                "router_rssi": to_float(r.get("router_rssi")),
+                "is_fake": False,
+            })
+
+        # 3) 누락 구간에 임의 포인트 삽입
+        filled = []
+        FIVE_MIN = 300  # 초
+
+        # (1) 실제 포인트들 사이
+        prev = None
+        for p in raw_points:
+            if prev is not None:
+                delta_sec = (p["ts"] - prev["ts"]).total_seconds()
+                # 두 포인트 사이에 몇 개의 5분 간격이 들어가나?
+                #   ex) 30분 차이 => 30/5 = 6 → 6-1 = 5개 생성
+                gaps = int(delta_sec // FIVE_MIN) - 1
+                if gaps > 0:
+                    for i in range(1, gaps + 1):
+                        ts_fake = prev["ts"] + timedelta(minutes=5 * i)
+                        filled.append({
+                            "ts": ts_fake,
+                            "rsrp": -125.0,
+                            "rsrq": -15.0,
+                            "sinr": 5.0,
+                            "router_rssi": -100.0,
+                            "is_fake": True,
+                        })
+            filled.append(p)
+            prev = p
+
+        # (2) 마지막 실제 포인트 이후 ~ now (또는 end+1일) 사이
+        if raw_points:
+            last = raw_points[-1]
+
+            # 원래 범위의 끝(날짜지정이면 end+1일, 최근모드면 now 근처)이랑
+            # "현재 시간" 중 더 이른 쪽까지만 채운다.
+            now_kst = datetime.now(tz=KST)
+            tail_to = range_end_boundary
+            if tail_to > now_kst:
+                tail_to = now_kst
+
+            # tail_to 가 마지막 포인트보다 과거면 채우지 않음
+            if tail_to > last["ts"]:
+                delta_sec = (tail_to - last["ts"]).total_seconds()
+                gaps_tail = int(delta_sec // FIVE_MIN) - 1
+                if gaps_tail > 0:
+                    for i in range(1, gaps_tail + 1):
+                        ts_fake = last["ts"] + timedelta(minutes=5 * i)
+                        if ts_fake >= tail_to:
+                            break
+                        filled.append({
+                            "ts": ts_fake,
+                            "rsrp": -125.0,
+                            "rsrq": -15.0,
+                            "sinr": 5.0,
+                            "router_rssi": -100.0,
+                            "is_fake": True,
+                        })
+        else:
+            filled = []  # 데이터 자체가 없으면 빈 리스트
+
+        # 4) 시간 순 정렬 (중간에 끼워넣었으니 한번 정렬)
+        filled.sort(key=lambda x: x["ts"])
+
+        # 5) JSON 직렬화를 위해 문자열로 변환
+        out = []
+        for p in filled:
+            out.append({
+                "ts": p["ts"].strftime("%Y-%m-%d %H:%M:%S"),
+                "rsrp": p["rsrp"],
+                "rsrq": p["rsrq"],
+                "sinr": p["sinr"],
+                "router_rssi": p["router_rssi"],
+                # is_fake는 나중에 필요하면 프론트에서 색 분리하는용
+                "is_fake": p["is_fake"],
+            })
+
+        return response.json({
+            "msisdn": msisdn,
+            "days": days,
+            "start": start,
+            "end": end,
+            "data": out,
+        })
+    except Exception as e:
+        ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+        async with aiofiles.open(os.path.join(app.ctx.log_dir, f"{datetime.now(tz=KST).strftime('%Y%m%d')}.log"), "ab") as f:
+            await f.write(f"[{ts}] METRICS_RAW_ERROR {repr(e)}\n".encode())
+        return response.json({"error": "query_failed", "detail": repr(e)}, status=500)
+    
+# 3) 기간별 상세 레코드 표 조회(페이징)
+#   /api/records?msisdn=...&start=2025-09-01&end=2025-09-12&page=1&page_size=200
+@app.get("/api/records", name="records")
+async def records(req: Request):
+    msisdn = req.args.get("msisdn")
+    start  = req.args.get("start")  # YYYY-MM-DD
+    end    = req.args.get("end")    # YYYY-MM-DD
+    page   = int(req.args.get("page", "1"))
+    size   = int(req.args.get("page_size", "200"))
+    order = (req.args.get("order") or "desc").lower()
+    order_sql = "ASC" if order == "asc" else "DESC"
+    if not (msisdn and start and end):
+        raise InvalidUsage("msisdn, start, end are required")
+
+    # ✅ 방어: 음수/말도안되는 값 방지 및 상한
+    page   = max(1, page)
+    size   = max(1, min(size, 1000))  # 최대 1000행
+    offset = (page - 1) * size
+
+    # ✅ LIMIT/OFFSET은 안전하게 정수 삽입, 나머지는 %s 바인딩
+    sql = f"""
+    SELECT
+      `id`,`ts_kst`,`datetime_str`,`system`,`plmn`,`band`,`earfcn_dl`,`earfcn_ul`,
+      `bandwidth`,`cell_id`,`pci`,`drx`,`rsrp`,`rsrq`,`rssi`,`tac`,`sinr`,`rrc_st`,`emc_st`,
+      `scell_band`,`scell_bw`,`scell_status`,`latitude`,`longitude`,`ip_v4`
+    FROM `router_info`
+    WHERE `msisdn`=%s
+      AND `ts_kst` >= %s
+      AND `ts_kst` < DATE_ADD(%s, INTERVAL 1 DAY)
+    ORDER BY `ts_kst` {order_sql}
+    LIMIT {size} OFFSET {offset}
+    """
+
+    async with app.ctx.pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            # (선택) KST 세션 타임존 고정이 필요하면 아래 줄 활성화
+            # await cur.execute("SET time_zone = '+09:00'")
+
+            # ▶ 여기서는 %s 자리표시자 3개만 전달
+            await cur.execute(sql, (msisdn, start, end))
+            rows = await cur.fetchall()
+
+            # datetime 직렬화 안전화
+            for r in rows:
+                if isinstance(r.get("ts_kst"), datetime):
+                    r["ts_kst"] = r["ts_kst"].strftime("%Y-%m-%d %H:%M:%S")
+
+            # total count는 그대로 %s 세 개만 사용
+            await cur.execute("""
+                SELECT COUNT(*) AS cnt
+                FROM `router_info`
+                WHERE `msisdn`=%s
+                  AND `ts_kst` >= %s
+                  AND `ts_kst` < DATE_ADD(%s, INTERVAL 1 DAY)
+            """, (msisdn, start, end))
+            total = (await cur.fetchone())["cnt"]
+
+            return response.json({
+                "msisdn": msisdn, "start": start, "end": end,
+                "page": page, "page_size": size, "total": total, "rows": rows
+            })
+        
+
+@app.get("/api/records/csv", name="records_csv")
+async def records_csv(req: Request):
+    msisdn = req.args.get("msisdn")
+    start  = req.args.get("start")    # YYYY-MM-DD
+    end    = req.args.get("end")      # YYYY-MM-DD
+    if not (msisdn and start and end):
+        raise InvalidUsage("msisdn, start, end are required")
+
+    # 🔽 정렬 파라미터 화이트리스트 (SQL 인젝션 방지)
+    order = (req.args.get("order") or "desc").lower()
+    order_sql = "ASC" if order == "asc" else "DESC"
+
+    sep = (req.args.get("sep") or "comma").lower()
+    if sep in ("semicolon", "semi", "sc"):
+        delimiter = ";"
+        ext = "csv"
+    elif sep in ("tab", "tsv"):
+        delimiter = "\t"
+        ext = "tsv"
+    else:
+        delimiter = ","
+        ext = "csv"
+
+    filename = f"router_{msisdn}_{start}_{end}.{ext}"
+
+    headers_cols = [
+        "id","ts_kst","datetime_str","system","plmn","band","earfcn_dl","earfcn_ul",
+        "bandwidth","cell_id","pci","drx","rsrp","rsrq","rssi","tac","sinr","rrc_st","emc_st",
+        "scell_band","scell_bw","scell_status","latitude","longitude","ip_v4"
+    ]
+
+    # 🔽 f-string 으로 ORDER BY에 {order_sql} 삽입 (나머지는 %s 바인딩 유지)
+    sql = f"""
+    SELECT
+      `id`,`ts_kst`,`datetime_str`,`system`,`plmn`,`band`,`earfcn_dl`,`earfcn_ul`,
+      `bandwidth`,`cell_id`,`pci`,`drx`,`rsrp`,`rsrq`,`rssi`,`tac`,`sinr`,`rrc_st`,`emc_st`,
+      `scell_band`,`scell_bw`,`scell_status`,`latitude`,`longitude`,`ip_v4`
+    FROM `router_info`
+    WHERE `msisdn`=%s
+      AND `ts_kst` >= %s
+      AND `ts_kst` < DATE_ADD(%s, INTERVAL 1 DAY)
+    ORDER BY `ts_kst` {order_sql}
+    """
+
+    # CSV를 메모리에서 생성
+    sio = io.StringIO(newline="")
+    # ★ 엑셀 호환을 위해 구분자/줄바꿈 명시
+    writer = csv.writer(
+        sio,
+        delimiter=delimiter,
+        lineterminator="\r\n",   # CRLF
+        quoting=csv.QUOTE_MINIMAL,
+        quotechar='"',
+        escapechar=None,
+    )
+    writer.writerow(headers_cols)  # 헤더
+
+    async with app.ctx.pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            # 필요 시 KST 고정: await cur.execute("SET time_zone = '+09:00'")
+            await cur.execute(sql, (msisdn, start, end))
+            while True:
+                rows = await cur.fetchmany(2000)
+                if not rows:
+                    break
+                for row in rows:
+                    row = list(row)
+                    # ts_kst: datetime → 문자열
+                    if isinstance(row[1], datetime):
+                        row[1] = row[1].strftime("%Y-%m-%d %H:%M:%S")
+                    writer.writerow(row)
+
+    content = "\ufeff" + sio.getvalue()  # UTF-8 BOM
+    headers_resp = {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    }
+    return response.raw(content.encode("utf-8"), headers=headers_resp)
+
+@app.post("/api/devices/alias", name="set_alias")
+async def set_alias(req: Request):
+    """
+    Body(JSON): { "msisdn": "01234...", "alias": "현장1호기" }
+    alias가 빈문자열/None이면 NULL로 저장(별칭 제거).
+    """
+    try:
+        data = req.json
+    except Exception:
+        raise InvalidUsage("invalid json")
+
+    msisdn = (data or {}).get("msisdn")
+    alias  = (data or {}).get("alias")
+    if not msisdn:
+        raise InvalidUsage("msisdn is required")
+
+    # 빈 별칭 → NULL 저장
+    if alias is not None:
+        alias = alias.strip()
+        if alias == "":
+            alias = None
+
+    async with app.ctx.pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            # INSERT .. ON DUPLICATE (VALUES 없이 파라미터로 두 번 바인딩)
+            sql = """
+            INSERT INTO devices (msisdn, alias) VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE alias = %s
+            """
+            await cur.execute(sql, (msisdn, alias, alias))
+
+    return response.json({"ok": True, "msisdn": msisdn, "alias": alias})
+
+#25.12.16 kdh
+# @app.delete("/api/devices", name="delete_device")
+# async def delete_device(req: Request):
+#     """
+#     Query params:
+#       - msisdn: 필수
+#       - cascade=1 이면 router_info 행도 같이 삭제(주의: 데이터 영구 삭제)
+#     """
+#     msisdn = req.args.get("msisdn")
+#     cascade = req.args.get("cascade", "0") in ("1", "true", "yes")
+
+#     if not msisdn:
+#         raise InvalidUsage("msisdn is required")
+
+#     async with app.ctx.pool.acquire() as conn:
+#         async with conn.cursor() as cur:
+#             if cascade:
+#                 # 모든 연관 데이터까지 삭제 (주의!)
+#                 await cur.execute("DELETE FROM router_info WHERE msisdn=%s", (msisdn,))
+#             # devices 목록에서 제거
+#             await cur.execute("DELETE FROM devices WHERE msisdn=%s", (msisdn,))
+
+#     return response.json({"ok": True, "msisdn": msisdn, "cascade": cascade})
+
+@app.delete("/api/devices", name="delete_device")
+async def delete_device(req: Request):
+    """
+    Query params:
+      - msisdn: 필수
+      - cascade=1 이면 router_info 행도 같이 삭제(주의: 데이터 영구 삭제)
+        (요구사항상 '휴면'이 목적이면 cascade는 보통 쓰지 않는 것을 권장)
+    """
+    msisdn = req.args.get("msisdn")
+    cascade = req.args.get("cascade", "0") in ("1", "true", "yes")
+
+    if not msisdn:
+        raise InvalidUsage("msisdn is required")
+
+    async with app.ctx.pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            if cascade:
+                await cur.execute("DELETE FROM router_info WHERE msisdn=%s", (msisdn,))
+
+            # ✅ 영구삭제 대신 휴면 처리
+            await cur.execute(
+                "UPDATE devices SET dormant=1, dormant_at=NOW() WHERE msisdn=%s",
+                (msisdn,)
+            )
+
+    return response.json({"ok": True, "msisdn": msisdn, "cascade": cascade, "dormant": True})
+
+# 휴면 해제 api
+@app.post("/api/devices/activate", name="activate_device")
+async def activate_device(req: Request):
+    data = req.json or {}
+    msisdn = data.get("msisdn")
+    if not msisdn:
+        raise InvalidUsage("msisdn is required")
+
+    async with app.ctx.pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE devices SET dormant=0, dormant_at=NULL WHERE msisdn=%s",
+                (msisdn,)
+            )
+
+    return response.json({"ok": True, "msisdn": msisdn, "dormant": False})
+
+@app.get("/healthz", name="healthz")
+async def health(_):
+    return response.json({"status": "ok"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=35443, access_log=False)

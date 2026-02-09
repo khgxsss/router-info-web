@@ -71,6 +71,10 @@ export default function Dashboard({ user, onLogout }) {
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [refreshSec, setRefreshSec] = useState(30);
 
+  // RSSI only mode
+  const [rssiOnly, setRssiOnly] = useState(false);
+  const [allDeviceRssi, setAllDeviceRssi] = useState([]); // [{msisdn, alias, data:[]}]
+
   // device settings modal
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [aliasInput, setAliasInput] = useState("");
@@ -179,6 +183,29 @@ export default function Dashboard({ user, onLogout }) {
     setTotal(d.total || 0);
   }, [msisdn, start, end, page, sortOrder]);
 
+  const fetchAllDeviceRssi = useCallback(async () => {
+    const activeDevices = (showDormant ? devices : devices.filter(d => !d.dormant))
+      .filter(d => d.has_recent);
+    if (!activeDevices.length) { setAllDeviceRssi([]); return; }
+
+    const endpoint = chartMode === "hourly_avg" ? "hourly_avg"
+      : chartMode === "daily_avg" ? "daily_avg" : "raw";
+
+    const results = await Promise.all(
+      activeDevices.map(async (dev) => {
+        const qs = `msisdn=${encodeURIComponent(dev.msisdn)}&start=${encodeURIComponent(chartStart)}&end=${encodeURIComponent(chartEnd)}`;
+        try {
+          const r = await fetch(`${API}/api/metrics/${endpoint}?${qs}`);
+          const d = await r.json();
+          return { msisdn: dev.msisdn, alias: dev.alias || "", data: d.data || [] };
+        } catch {
+          return { msisdn: dev.msisdn, alias: dev.alias || "", data: [] };
+        }
+      })
+    );
+    setAllDeviceRssi(results.filter(r => r.data.length > 0));
+  }, [devices, showDormant, chartMode, chartStart, chartEnd]);
+
   const refreshAll = useCallback(async () => {
     await Promise.all([
       loadDevices(msisdn || null),
@@ -241,6 +268,17 @@ export default function Dashboard({ user, onLogout }) {
       } catch {}
     })();
   }, [fetchChart, msisdn, tab]);
+
+  // rssiOnly 모드: 전체 기기 RSSI fetch
+  useEffect(() => {
+    if (!rssiOnly || tab !== "chart") return;
+    (async () => {
+      try {
+        await fetchAllDeviceRssi();
+        stampUpdated();
+      } catch {}
+    })();
+  }, [rssiOnly, tab, fetchAllDeviceRssi]);
 
   // table params 변경 시
   useEffect(() => {
@@ -402,6 +440,17 @@ export default function Dashboard({ user, onLogout }) {
 
         <div style={{ flex: 1 }} />
 
+        {tab === "chart" ? (
+          <label style={{ ...styles.checkboxLabel, marginRight: 4 }}>
+            <input
+              type="checkbox"
+              checked={rssiOnly}
+              onChange={(e) => setRssiOnly(e.target.checked)}
+            />
+            <span style={{ marginLeft: 6 }}>RSSI만 보기</span>
+          </label>
+        ) : null}
+
         <button onClick={() => setTab("chart")} style={btn(tab === "chart")}>그래프</button>
         <button onClick={() => setTab("table")} style={btn(tab === "table")}>상세</button>
       </div>
@@ -437,7 +486,26 @@ export default function Dashboard({ user, onLogout }) {
             </div>
           </div>
 
-          {chartData.length === 0 ? (
+          {rssiOnly ? (
+            allDeviceRssi.length === 0 ? (
+              <div style={styles.empty}>해당 범위에 RSSI 데이터가 없습니다.</div>
+            ) : (
+              allDeviceRssi.map(({ msisdn: devMsisdn, alias, data }) => {
+                const label = alias ? `${alias} (${devMsisdn})` : devMsisdn;
+                const dataKey = "router_rssi" + modeConfig.suffix;
+                return (
+                  <MetricChart
+                    key={devMsisdn}
+                    title={`RSSI — ${label}`}
+                    data={data}
+                    dataKey={dataKey}
+                    xKey={modeConfig.xKey}
+                    metric="router_rssi"
+                  />
+                );
+              })
+            )
+          ) : chartData.length === 0 ? (
             <div style={styles.empty}>해당 범위에 데이터가 없습니다.</div>
           ) : (
             CHART_METRICS.map(({ title, metric }) => {

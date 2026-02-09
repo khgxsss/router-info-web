@@ -131,27 +131,19 @@ git push origin main
 
 ## 배포
 
-### 백엔드 배포
+### 백엔드만 배포
 
 ```bash
-# 1) 서버 파일 복사
 cp /home/rcn01/router-info-web/router_info_server.py /home/rcn01/router_info_server.py
-
-# 2) 서비스 재시작
 sudo systemctl restart router-info
-
-# 3) 상태 확인
 sudo systemctl status router-info
 ```
 
-### 프론트엔드 배포
+### 프론트엔드만 배포
 
 ```bash
-# 1) 빌드
 cd /home/rcn01/router-info-web
 npm run build
-
-# 2) Nginx 정적 파일 교체
 sudo rm -rf /var/www/router-info/*
 sudo cp -r dist/* /var/www/router-info/
 ```
@@ -166,6 +158,65 @@ sudo systemctl restart router-info
 npm run build
 sudo rm -rf /var/www/router-info/*
 sudo cp -r dist/* /var/www/router-info/
+```
+
+---
+
+## 코드 수정 후 재배포
+
+### Windows에서 수정한 경우
+
+```bash
+# === Windows ===
+git add -A
+git commit -m "변경 내용 설명"
+git push origin main
+
+# === Ubuntu ===
+cd /home/rcn01/router-info-web
+git pull origin main
+
+# 백엔드 수정 시
+cp router_info_server.py /home/rcn01/router_info_server.py
+sudo systemctl restart router-info
+
+# 프론트엔드 수정 시
+npm run build
+sudo rm -rf /var/www/router-info/*
+sudo cp -r dist/* /var/www/router-info/
+```
+
+### Ubuntu에서 직접 수정한 경우
+
+```bash
+cd /home/rcn01/router-info-web
+
+# 코드 수정 후 커밋
+git add -A
+git commit -m "변경 내용 설명"
+git push origin main
+
+# 백엔드 수정 시
+cp router_info_server.py /home/rcn01/router_info_server.py
+sudo systemctl restart router-info
+
+# 프론트엔드 수정 시
+npm run build
+sudo rm -rf /var/www/router-info/*
+sudo cp -r dist/* /var/www/router-info/
+```
+
+### 배포 후 확인
+
+```bash
+# 백엔드 상태
+sudo systemctl status router-info
+
+# 백엔드 로그 (최근 20줄)
+sudo journalctl -u router-info -n 20 --no-pager
+
+# 헬스체크
+curl http://localhost:35443/healthz
 ```
 
 ---
@@ -242,16 +293,27 @@ SELECT COUNT(*) FROM devices;
 | `DB_PASS` | (없음) | DB 비밀번호 |
 | `DB_NAME` | `ROUTER_INFO` | 데이터베이스명 |
 
-systemd 서비스에서 환경변수를 설정하려면:
+systemd 서비스 파일에서 환경변수를 설정:
 
 ```bash
-sudo systemctl edit router-info
+sudo vi /etc/systemd/system/router-info.service
 ```
+
+`[Service]` 섹션에 `Environment` 추가:
 
 ```ini
 [Service]
+User=rcn01
+Group=rcn01
+WorkingDirectory=/home/rcn01
+ExecStart=/usr/bin/python3.12 /home/rcn01/router_info_server.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
 Environment=DB_PASS=your_password_here
 ```
+
+수정 후 반영:
 
 ```bash
 sudo systemctl daemon-reload
