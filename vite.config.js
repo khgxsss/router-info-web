@@ -7,6 +7,6 @@ export default defineConfig({
   server: {
     host: true,    // 외부에서도 접속 가능 (0.0.0.0)
     port: 35442,    // 고정 포트
-    strictPort: true // 5173 이미 사용 중이면 에러를 내고 종료 (자동 포트 변경 방지)
+    strictPort: true // 35442 이미 사용 중이면 에러를 내고 종료 (자동 포트 변경 방지)
   }
 })

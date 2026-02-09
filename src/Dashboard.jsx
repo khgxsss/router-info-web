@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   LineChart,
   Line,
@@ -16,10 +16,24 @@ const API = "";
 
 /** 지표 기준/상한(요청 반영: 하한 삭제, 상한만) */
 const REF = {
-  rsrp: { center: -100, upper: -84 }, // 기준선은 유지, 상한선은 -84
+  rsrp: { center: -100, upper: -84 },
   rsrq: { center: -10, upper: -6 },
   sinr: { center: 15, upper: 19 },
   router_rssi: { center: -70, upper: -56 },
+};
+
+/** 차트 모드별 설정 */
+const CHART_METRICS = [
+  { title: "RSSI (dBm)", metric: "router_rssi" },
+  { title: "SINR (dB)", metric: "sinr" },
+  { title: "RSRQ (dB)", metric: "rsrq" },
+  { title: "RSRP (dBm)", metric: "rsrp" },
+];
+
+const CHART_MODE_CONFIG = {
+  raw:        { suffix: "",     xKey: "ts" },
+  hourly_avg: { suffix: "_avg", xKey: "h" },
+  daily_avg:  { suffix: "_avg", xKey: "d" },
 };
 
 export default function Dashboard({ user, onLogout }) {
@@ -78,7 +92,6 @@ export default function Dashboard({ user, onLogout }) {
   );
 
   function sortDevices(list) {
-    // 닉네임(있으면) 기준 정렬, 없으면 msisdn
     return [...list].sort((a, b) => {
       const aName = (a.alias || "").trim();
       const bName = (b.alias || "").trim();
@@ -90,7 +103,7 @@ export default function Dashboard({ user, onLogout }) {
     });
   }
 
-  async function loadDevices(selectMsisdn = null) {
+  const loadDevices = useCallback(async (selectMsisdn = null) => {
     const url = `${API}/api/msisdns?include_dormant=${showDormant ? 1 : 0}`;
     const r = await fetch(url);
     const d = await r.json();
@@ -102,17 +115,16 @@ export default function Dashboard({ user, onLogout }) {
 
     setDevices(list);
 
-    // 선택 유지/초기 선택
     if (selectMsisdn) {
       setMsisdn(selectMsisdn);
-      return;
+      return list;
     }
-    if (!msisdn && list.length) {
-      // 최근 데이터 있는 기기 우선
+    if (!selectMsisdn && list.length) {
       const firstActive = list.find((x) => x.has_recent && !x.dormant);
       setMsisdn(firstActive ? firstActive.msisdn : list[0].msisdn);
     }
-  }
+    return list;
+  }, [showDormant]);
 
   function stampUpdated() {
     const now = new Date();
@@ -129,7 +141,7 @@ export default function Dashboard({ user, onLogout }) {
     setLastUpdated(s);
   }
 
-  async function fetchChart(force = false) {
+  const fetchChart = useCallback(async () => {
     if (!msisdn) return;
 
     const qs = `msisdn=${encodeURIComponent(msisdn)}&start=${encodeURIComponent(chartStart)}&end=${encodeURIComponent(chartEnd)}`;
@@ -137,33 +149,24 @@ export default function Dashboard({ user, onLogout }) {
     if (chartMode === "hourly_avg") {
       const r = await fetch(`${API}/api/metrics/hourly_avg?${qs}`);
       const d = await r.json();
-      const next = d.data || [];
-      if (force || JSON.stringify(next) !== JSON.stringify(hourly)) {
-        setHourly(next);
-      }
+      setHourly(d.data || []);
       return;
     }
 
     if (chartMode === "daily_avg") {
       const r = await fetch(`${API}/api/metrics/daily_avg?${qs}`);
       const d = await r.json();
-      const next = d.data || [];
-      if (force || JSON.stringify(next) !== JSON.stringify(daily)) {
-        setDaily(next);
-      }
+      setDaily(d.data || []);
       return;
     }
 
-    // raw(모든 데이터)
+    // raw
     const r = await fetch(`${API}/api/metrics/raw?${qs}`);
     const d = await r.json();
-    const next = d.data || [];
-    if (force || JSON.stringify(next) !== JSON.stringify(raw)) {
-      setRaw(next);
-    }
-  }
+    setRaw(d.data || []);
+  }, [msisdn, chartMode, chartStart, chartEnd]);
 
-  async function fetchTable(force = false) {
+  const fetchTable = useCallback(async () => {
     if (!msisdn) return;
     const url =
       `${API}/api/records?msisdn=${encodeURIComponent(msisdn)}` +
@@ -172,30 +175,20 @@ export default function Dashboard({ user, onLogout }) {
 
     const r = await fetch(url);
     const d = await r.json();
+    setRows(d.rows || []);
+    setTotal(d.total || 0);
+  }, [msisdn, start, end, page, sortOrder]);
 
-    const nextRows = d.rows || [];
-    const nextTotal = d.total || 0;
-
-    if (force || JSON.stringify(nextRows) !== JSON.stringify(rows) || nextTotal !== total) {
-      setRows(nextRows);
-      setTotal(nextTotal);
-    }
-  }
-
-  async function refreshAll(force = false) {
+  const refreshAll = useCallback(async () => {
     await Promise.all([
-      loadDevices(msisdn || null), // 목록도 최신화(닉네임/휴면/최근 여부)
-      tab === "chart" ? fetchChart(force) : fetchTable(force),
+      loadDevices(msisdn || null),
+      tab === "chart" ? fetchChart() : fetchTable(),
     ]);
     stampUpdated();
-  }
+  }, [loadDevices, msisdn, tab, fetchChart, fetchTable]);
 
   const visibleDevices = useMemo(() => {
-    // devices: 전체
-    // showDormant: 휴면기기 보기 체크
-    const list = showDormant ? devices : devices.filter(d => !d.is_dormant);
-    // 닉네임 정렬 등 기존 로직 유지
-    return list;
+    return showDormant ? devices : devices.filter(d => !d.dormant);
   }, [devices, showDormant]);
 
   // ---------- effects ----------
@@ -206,65 +199,59 @@ export default function Dashboard({ user, onLogout }) {
         await loadDevices(msisdn || null);
       } catch {}
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showDormant]);
+  }, [loadDevices]);
 
   useEffect(() => {
     if (!visibleDevices || visibleDevices.length === 0) {
-      // 목록 자체가 없으면 선택값도 비움
       if (msisdn) setMsisdn("");
       return;
     }
 
-    // 현재 선택된 msisdn이 드롭다운 목록에 존재하는지 확인
     const exists = visibleDevices.some(d => d.msisdn === msisdn);
 
-    // 없으면 첫 번째 항목으로 강제 교체 (그래프/표도 이 msisdn 기준으로 다시 로드됨)
     if (!exists) {
       setMsisdn(visibleDevices[0].msisdn);
-      setPage?.(1); // 상세 페이징 쓰면 같이 초기화
+      setPage(1);
     }
   }, [showDormant, visibleDevices, msisdn]);
 
-  // msisdn 바뀌면 데이터 로드
+  // msisdn 바뀌면 현재 활성 탭 데이터만 로드
   useEffect(() => {
     if (!msisdn) return;
     setAliasInput(selectedDevice?.alias || "");
     (async () => {
       try {
-        await fetchChart(true);
-        await fetchTable(true);
+        if (tab === "chart") {
+          await fetchChart();
+        } else {
+          await fetchTable();
+        }
         stampUpdated();
       } catch {}
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [msisdn]);
+  }, [msisdn, tab, fetchChart, fetchTable, selectedDevice]);
 
   // chart params 변경 시
   useEffect(() => {
-    if (!msisdn) return;
-    if (tab !== "chart") return;
+    if (!msisdn || tab !== "chart") return;
     (async () => {
       try {
-        await fetchChart(false);
+        await fetchChart();
         stampUpdated();
       } catch {}
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, chartMode, chartStart, chartEnd]);
+  }, [fetchChart, msisdn, tab]);
 
   // table params 변경 시
   useEffect(() => {
-    if (!msisdn) return;
-    if (tab !== "table") return;
+    if (!msisdn || tab !== "table") return;
     (async () => {
       try {
-        await fetchTable(false);
+        await fetchTable();
         stampUpdated();
       } catch {}
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, start, end, page, sortOrder]);
+  }, [fetchTable, msisdn, tab]);
 
   // auto refresh timer
   useEffect(() => {
@@ -275,15 +262,15 @@ export default function Dashboard({ user, onLogout }) {
 
     const ms = Math.max(5, Number(refreshSec || 30)) * 1000;
     timerRef.current = setInterval(() => {
-      refreshAll(false);
+      refreshAll();
     }, ms);
 
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
       timerRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefresh, refreshSec, tab, msisdn, chartMode, chartStart, chartEnd, start, end, page, sortOrder, showDormant]);
+  }, [autoRefresh, refreshSec, refreshAll]);
+
   // ---------- actions ----------
   async function handleSaveAlias() {
     if (!msisdn) return;
@@ -300,7 +287,6 @@ export default function Dashboard({ user, onLogout }) {
       return;
     }
 
-    // ✅ 가장 확실: 서버에서 목록 다시 로드(정렬/has_recent/dormant 모두 반영)
     await loadDevices(msisdn);
     setSettingsOpen(false);
     stampUpdated();
@@ -320,14 +306,11 @@ export default function Dashboard({ user, onLogout }) {
       return;
     }
 
-    // 휴면 처리 후: 목록 재조회 (showDormant=false면 목록에서 사라짐)
-    await loadDevices(null);
-
-    // 선택 msisdn이 목록에 없어졌으면 첫 번째로 이동
-    const still = devices.some((d) => d.msisdn === msisdn);
+    // loadDevices가 반환하는 최신 목록으로 판단
+    const freshList = await loadDevices(null);
+    const still = freshList.some((d) => d.msisdn === msisdn);
     if (!still) {
-      const list = await safeGetDevices(showDormant);
-      if (list.length) setMsisdn(list[0].msisdn);
+      if (freshList.length) setMsisdn(freshList[0].msisdn);
       else setMsisdn("");
     }
 
@@ -335,22 +318,15 @@ export default function Dashboard({ user, onLogout }) {
     stampUpdated();
   }
 
-  async function safeGetDevices(includeDormant) {
-    const url = `${API}/api/msisdns?include_dormant=${includeDormant ? 1 : 0}`;
-    const r = await fetch(url);
-    const d = await r.json();
-    return sortDevices((d.devices || []).map((x) => ({
-      ...x,
-      dormant: !!x.dormant,
-      has_recent: !!x.has_recent,
-    })));
-  }
-
-  // ---------- render ----------
+  // ---------- render helpers ----------
   const deviceLabel = (d) => {
     const name = (d.alias || "").trim();
     return name ? `${name} (${d.msisdn})` : d.msisdn;
   };
+
+  // 현재 chart mode에 맞는 데이터/키 결정
+  const chartData = chartMode === "raw" ? raw : chartMode === "hourly_avg" ? hourly : daily;
+  const modeConfig = CHART_MODE_CONFIG[chartMode];
 
   return (
     <div style={styles.page}>
@@ -374,10 +350,7 @@ export default function Dashboard({ user, onLogout }) {
             ))}
           </select>
           <div style={{ width: 12 }} />
-          <button
-            onClick={() => refreshAll(true)} // ✅ 강제 갱신
-            style={styles.primaryBtn}
-          >
+          <button onClick={() => refreshAll()} style={styles.primaryBtn}>
             새로고침
           </button>
 
@@ -464,40 +437,23 @@ export default function Dashboard({ user, onLogout }) {
             </div>
           </div>
 
-          {/* chart data */}
-          {chartMode === "raw" ? (
-            raw.length === 0 ? (
-              <div style={styles.empty}>해당 범위에 데이터가 없습니다.</div>
-            ) : (
-              <>
-                <MetricChart title="RSSI (dBm)" data={raw} dataKey="router_rssi" xKey="ts" metric="router_rssi" />
-                <MetricChart title="SINR (dB)" data={raw} dataKey="sinr" xKey="ts" metric="sinr" />
-                <MetricChart title="RSRQ (dB)" data={raw} dataKey="rsrq" xKey="ts" metric="rsrq" />
-                <MetricChart title="RSRP (dBm)" data={raw} dataKey="rsrp" xKey="ts" metric="rsrp" />
-              </>
-            )
-          ) : chartMode === "hourly_avg" ? (
-            hourly.length === 0 ? (
-              <div style={styles.empty}>해당 범위에 데이터가 없습니다.</div>
-            ) : (
-              <>
-                <MetricChart title="RSSI (dBm)" data={hourly} dataKey="router_rssi_avg" xKey="h" metric="router_rssi" />
-                <MetricChart title="SINR (dB)" data={hourly} dataKey="sinr_avg" xKey="h" metric="sinr" />
-                <MetricChart title="RSRQ (dB)" data={hourly} dataKey="rsrq_avg" xKey="h" metric="rsrq" />
-                <MetricChart title="RSRP (dBm)" data={hourly} dataKey="rsrp_avg" xKey="h" metric="rsrp" />
-              </>
-            )
+          {chartData.length === 0 ? (
+            <div style={styles.empty}>해당 범위에 데이터가 없습니다.</div>
           ) : (
-            daily.length === 0 ? (
-              <div style={styles.empty}>해당 범위에 데이터가 없습니다.</div>
-            ) : (
-              <>
-                <MetricChart title="RSSI (dBm)" data={daily} dataKey="router_rssi_avg" xKey="d" metric="router_rssi" />
-                <MetricChart title="SINR (dB)" data={daily} dataKey="sinr_avg" xKey="d" metric="sinr" />
-                <MetricChart title="RSRQ (dB)" data={daily} dataKey="rsrq_avg" xKey="d" metric="rsrq" />
-                <MetricChart title="RSRP (dBm)" data={daily} dataKey="rsrp_avg" xKey="d" metric="rsrp" />
-              </>
-            )
+            CHART_METRICS.map(({ title, metric }) => {
+              const baseKey = metric === "router_rssi" ? "router_rssi" : metric;
+              const dataKey = baseKey + modeConfig.suffix;
+              return (
+                <MetricChart
+                  key={metric}
+                  title={title}
+                  data={chartData}
+                  dataKey={dataKey}
+                  xKey={modeConfig.xKey}
+                  metric={metric}
+                />
+              );
+            })
           )}
         </div>
       ) : (
@@ -575,7 +531,7 @@ export default function Dashboard({ user, onLogout }) {
             </table>
           </div>
 
-          {/* ✅ 오른쪽에 떠다니는 페이징 */}
+          {/* 오른쪽에 떠다니는 페이징 */}
           <div style={styles.floatingPager}>
             <button disabled={page <= 1} onClick={() => setPage((p) => p - 1)} style={styles.pagerBtn}>
               이전
@@ -622,7 +578,7 @@ export default function Dashboard({ user, onLogout }) {
 
               <div style={{ borderTop: "1px solid #e5e7eb", paddingTop: 12, marginTop: 6 }}>
                 <div style={{ color: "#6b7280", fontSize: 13, marginBottom: 8 }}>
-                  기기 삭제는 영구 삭제가 아니라 “휴면 처리”로 동작합니다.
+                  기기 삭제는 영구 삭제가 아니라 "휴면 처리"로 동작합니다.
                 </div>
                 <button onClick={handleDormantDevice} style={styles.dangerBtn}>
                   기기 휴면 처리
@@ -641,7 +597,6 @@ function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
   const hideXAxisLabels = xKey === "ts" || xKey === "h";
   const ref = REF[metric];
 
-  // Y 도메인: 기준선이 중앙에 가깝게 보이도록 대칭 도메인 계산(데이터+기준+상한 포함)
   let yDomain = undefined;
   if (ref) {
     const vals = (data || [])
@@ -661,12 +616,11 @@ function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
       const pad = Math.max(delta * 0.05, 1);
       yDomain = [center - (delta + pad), center + (delta + pad)];
     } else {
-      // 데이터 없으면 기준~상한만 포함(대칭)
       const delta = Math.abs(ref.upper - ref.center);
       yDomain = [ref.center - delta, ref.center + delta];
     }
     if (yDomain && (!Number.isFinite(yDomain[0]) || !Number.isFinite(yDomain[1]))) {
-      yDomain = undefined; // Recharts 자동 스케일로 fallback
+      yDomain = undefined;
     }
   }
 
@@ -685,7 +639,7 @@ function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
           <YAxis domain={yDomain} tickFormatter={(v) => (Number.isFinite(v) ? Math.round(v) : v)}/>
           <Tooltip
             formatter={(value) => {
-              if (typeof value === "number") return Number(value.toFixed(3)); // 소수점 3자리 반올림
+              if (typeof value === "number") return Number(value.toFixed(3));
               return value;
             }}
           />
@@ -700,9 +654,7 @@ function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
 
           {ref ? (
             <>
-              {/* 기준값: 연두색 굵은 선 */}
               <ReferenceLine y={ref.center} stroke="#32CD32" strokeWidth={3} />
-              {/* 상한값: 빨간색 얇은 점선 */}
               <ReferenceLine y={ref.upper} stroke="#ef4444" strokeWidth={1} strokeDasharray="4 4" />
             </>
           ) : null}
@@ -753,7 +705,7 @@ function todayOffset(n) {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(base); // YYYY-MM-DD
+  }).format(base);
 }
 
 function btn(active) {
@@ -907,11 +859,7 @@ const styles = {
     borderRadius: 14,
     background: "#ffffff",
     boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-
-    // ✅ 화면 높이에 따라 자동으로 적당히
     maxHeight: "calc(100vh - 260px)",
-
-    // iOS 등에서 스크롤 부드럽게
     WebkitOverflowScrolling: "touch",
   },
 
@@ -919,7 +867,7 @@ const styles = {
     borderCollapse: "collapse",
     width: "100%",
     fontSize: 13,
-    minWidth: 980, // ✅ 너무 좁아지면 가로 스크롤로 전환
+    minWidth: 980,
   },
 
   th: {
@@ -934,7 +882,7 @@ const styles = {
     fontSize: 13,
     letterSpacing: 0.2,
     zIndex: 2,
-    whiteSpace: "nowrap", // ✅ 헤더도 줄바꿈 방지
+    whiteSpace: "nowrap",
   },
 
   td: {
@@ -979,7 +927,7 @@ const styles = {
     position: "sticky",
     right: 12,
     bottom: 12,
-    float: "right",            // 일부 브라우저에서 sticky 보강용
+    float: "right",
     display: "flex",
     alignItems: "center",
     gap: 10,
