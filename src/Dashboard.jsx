@@ -847,11 +847,19 @@ function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
     const w = container.clientWidth;
     const h = container.clientHeight - 28; // 타이틀 높이 빼기
 
-    // X축 포맷터: 모든 모드에서 MM-DD만 표시 (겹침 방지, 상세 시간은 툴팁에서 확인)
-    const xValues = (u, splits) => splits.map((v) => {
-      const d = new Date(v * 1000);
-      return `${(d.getMonth() + 1).toString().padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")}`;
-    });
+    // X축 포맷터: 시간별 평균은 MM-DD:HH, 나머지는 MM-DD
+    const xValues = xKey === "h"
+      ? (u, splits) => splits.map((v) => {
+          const d = new Date(v * 1000);
+          const mm = (d.getMonth() + 1).toString().padStart(2, "0");
+          const dd = d.getDate().toString().padStart(2, "0");
+          const hh = d.getHours().toString().padStart(2, "0");
+          return `${mm}-${dd}:${hh}`;
+        })
+      : (u, splits) => splits.map((v) => {
+          const d = new Date(v * 1000);
+          return `${(d.getMonth() + 1).toString().padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")}`;
+        });
 
     const opts = {
       width: w,
