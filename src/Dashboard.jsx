@@ -659,12 +659,7 @@ function parseXToEpoch(val, xKey) {
     const d = new Date(val + "T00:00:00+09:00");
     return isNaN(d) ? null : d.getTime() / 1000;
   }
-  if (xKey === "h") {
-    // "2025-01-15 14" -> epoch seconds
-    const d = new Date(val.replace(" ", "T") + ":00:00+09:00");
-    return isNaN(d) ? null : d.getTime() / 1000;
-  }
-  // ts: "2025-01-15 14:30:00"
+  // h: "2025-01-15 14:00:00" 또는 ts: "2025-01-15 14:30:00"
   const d = new Date(val.replace(" ", "T") + "+09:00");
   return isNaN(d) ? null : d.getTime() / 1000;
 }
@@ -709,6 +704,88 @@ function refLinesPlugin(ref) {
           }
         },
       ],
+    },
+  };
+}
+
+/** 마우스 커서 위치에 뜨는 플로팅 툴팁 플러그인 */
+function cursorTooltipPlugin() {
+  let tooltip;
+
+  function init(u) {
+    tooltip = document.createElement("div");
+    Object.assign(tooltip.style, {
+      position: "absolute",
+      display: "none",
+      pointerEvents: "none",
+      background: "rgba(255,255,255,0.95)",
+      border: "1px solid #d1d5db",
+      borderRadius: "8px",
+      padding: "6px 10px",
+      fontSize: "12px",
+      fontWeight: "700",
+      color: "#111827",
+      boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
+      zIndex: "100",
+      whiteSpace: "nowrap",
+      lineHeight: "1.5",
+    });
+    u.over.appendChild(tooltip);
+  }
+
+  function setCursor(u) {
+    const idx = u.cursor.idx;
+    if (idx == null) {
+      tooltip.style.display = "none";
+      return;
+    }
+
+    const xVal = u.data[0][idx];
+    const yVal = u.data[1][idx];
+
+    if (xVal == null || yVal == null) {
+      tooltip.style.display = "none";
+      return;
+    }
+
+    // 시간 포맷
+    const d = new Date(xVal * 1000);
+    const pad2 = (n) => n.toString().padStart(2, "0");
+    const timeStr = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+
+    // 값 포맷
+    const valStr = typeof yVal === "number" ? yVal.toFixed(3) : yVal;
+    const label = u.series[1]?.label || "값";
+
+    tooltip.innerHTML = `<div style="color:#6b7280;font-size:11px">${timeStr}</div><div>${label}: <span style="color:#2563eb">${valStr}</span></div>`;
+    tooltip.style.display = "block";
+
+    // 위치 계산: 커서 근처, 차트 밖으로 안 벗어나게
+    const cx = u.valToPos(xVal, "x");
+    const cy = u.valToPos(yVal, "y");
+    const overRect = u.over.getBoundingClientRect();
+    const ttRect = tooltip.getBoundingClientRect();
+
+    let left = cx + 12;
+    let top = cy - ttRect.height - 8;
+
+    // 오른쪽 넘치면 왼쪽으로
+    if (left + ttRect.width > overRect.width) {
+      left = cx - ttRect.width - 12;
+    }
+    // 위로 넘치면 아래로
+    if (top < 0) {
+      top = cy + 12;
+    }
+
+    tooltip.style.left = left + "px";
+    tooltip.style.top = top + "px";
+  }
+
+  return {
+    hooks: {
+      init: [init],
+      setCursor: [setCursor],
     },
   };
 }
@@ -770,16 +847,11 @@ function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
     const w = container.clientWidth;
     const h = container.clientHeight - 28; // 타이틀 높이 빼기
 
-    // X축 포맷터 결정
-    const xValues = xKey === "d"
-      ? (u, splits) => splits.map((v) => {
-          const d = new Date(v * 1000);
-          return `${(d.getMonth() + 1).toString().padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")}`;
-        })
-      : (u, splits) => splits.map((v) => {
-          const d = new Date(v * 1000);
-          return `${(d.getMonth() + 1).toString().padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")} ${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
-        });
+    // X축 포맷터: 모든 모드에서 MM-DD만 표시 (겹침 방지, 상세 시간은 툴팁에서 확인)
+    const xValues = (u, splits) => splits.map((v) => {
+      const d = new Date(v * 1000);
+      return `${(d.getMonth() + 1).toString().padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")}`;
+    });
 
     const opts = {
       width: w,
@@ -787,8 +859,8 @@ function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
       cursor: {
         drag: { x: false, y: false },
       },
-      plugins: [refLinesPlugin(ref)],
-      legend: { show: true },
+      plugins: [refLinesPlugin(ref), cursorTooltipPlugin()],
+      legend: { show: false },
       scales: {
         x: { time: true },
         y: yRange
@@ -801,7 +873,7 @@ function MetricChart({ title, data, dataKey, xKey = "d", metric }) {
           grid: { stroke: "rgba(209,213,219,0.5)", dash: [4, 4] },
           values: xValues,
           font: "12px system-ui",
-          ticks: { show: xKey === "d" },
+          ticks: { show: true },
         },
         {
           stroke: "#6b7280",
